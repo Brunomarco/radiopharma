@@ -1,7 +1,7 @@
 """
 Professional OTP Management Dashboard
 For Top Management Reporting
-Version 1.0
+Version 2.0 - Optimized Performance
 """
 
 import streamlit as st
@@ -56,17 +56,13 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# Initialize session state
-if 'data_loaded' not in st.session_state:
-    st.session_state.data_loaded = False
-if 'processed_data' not in st.session_state:
-    st.session_state.processed_data = None
-
-def load_and_process_data(uploaded_file) -> pd.DataFrame:
+# Cache data processing functions
+@st.cache_data(show_spinner=False)
+def load_and_process_data(file_content, file_name) -> pd.DataFrame:
     """Load and process the Excel data with proper date handling and filtering"""
     try:
-        # Read Excel file
-        df = pd.read_excel(uploaded_file, engine='openpyxl')
+        # Read Excel file from bytes
+        df = pd.read_excel(io.BytesIO(file_content), engine='openpyxl')
         
         # Convert date columns to datetime
         date_columns = ['ORD CREATE', 'READY', 'QT PU', 'ACT PU', 'READY_1', 
@@ -90,9 +86,9 @@ def load_and_process_data(uploaded_file) -> pd.DataFrame:
         df_filtered['TOTAL CHARGES'] = pd.to_numeric(df_filtered['TOTAL CHARGES'], errors='coerce').fillna(0)
         df_filtered['Time In Transit'] = pd.to_numeric(df_filtered['Time In Transit'], errors='coerce').fillna(0)
         
-        # Calculate OTP status
-        df_filtered['OTP_Objective'] = 95  # 95% objective
-        df_filtered['Is_On_Time'] = df_filtered['Time In Transit'] <= 72  # Assuming 72 hours as on-time threshold
+        # Calculate OTP status (assuming 72 hours as on-time threshold)
+        df_filtered['OTP_Objective'] = 95
+        df_filtered['Is_On_Time'] = df_filtered['Time In Transit'] <= 72
         
         # Identify controllable QC categories
         controllable_keywords = ['Agent', 'Customs', 'Warehouse']
@@ -106,6 +102,7 @@ def load_and_process_data(uploaded_file) -> pd.DataFrame:
         st.error(f"Error processing data: {str(e)}")
         return None
 
+@st.cache_data(show_spinner=False)
 def calculate_otp_metrics(df: pd.DataFrame) -> Dict:
     """Calculate OTP Gross and Net metrics"""
     metrics = {}
@@ -133,8 +130,9 @@ def calculate_otp_metrics(df: pd.DataFrame) -> Dict:
     
     return metrics
 
-def create_monthly_trend_chart(df: pd.DataFrame) -> go.Figure:
-    """Create monthly OTP trend chart"""
+@st.cache_data(show_spinner=False)
+def create_monthly_trend_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Prepare monthly trend data"""
     monthly_data = []
     
     for month in df['Delivery_Month_Str'].unique():
@@ -162,8 +160,59 @@ def create_monthly_trend_chart(df: pd.DataFrame) -> go.Figure:
                 'Total Charges': month_df['TOTAL CHARGES'].sum()
             })
     
-    monthly_df = pd.DataFrame(monthly_data).sort_values('Month')
+    return pd.DataFrame(monthly_data).sort_values('Month')
+
+@st.cache_data(show_spinner=False)
+def create_country_metrics(df: pd.DataFrame) -> pd.DataFrame:
+    """Calculate country-wise metrics"""
+    country_metrics = []
     
+    for country in df['PU CTRY'].unique():
+        if pd.notna(country):
+            country_df = df[df['PU CTRY'] == country]
+            
+            total = len(country_df)
+            on_time = country_df['Is_On_Time'].sum()
+            otp = (on_time / total * 100) if total > 0 else 0
+            
+            country_metrics.append({
+                'Country': country,
+                'OTP %': otp,
+                'Total Shipments': total,
+                'Total Pieces': country_df['PIECES'].sum(),
+                'Total Charges': country_df['TOTAL CHARGES'].sum(),
+                'Avg Transit Time': country_df['Time In Transit'].mean()
+            })
+    
+    return pd.DataFrame(country_metrics)
+
+@st.cache_data(show_spinner=False)
+def create_shipper_analysis(df: pd.DataFrame) -> pd.DataFrame:
+    """Create shipper-wise analysis table"""
+    shipper_metrics = []
+    
+    for shipper in df['SHIPPER NAME'].unique():
+        if pd.notna(shipper):
+            shipper_df = df[df['SHIPPER NAME'] == shipper]
+            
+            total = len(shipper_df)
+            on_time = shipper_df['Is_On_Time'].sum()
+            otp = (on_time / total * 100) if total > 0 else 0
+            
+            shipper_metrics.append({
+                'Shipper': shipper[:50],  # Truncate long names
+                'Total Shipments': total,
+                'On-Time': on_time,
+                'OTP %': round(otp, 1),
+                'Total Pieces': int(shipper_df['PIECES'].sum()),
+                'Total Charges ($)': round(shipper_df['TOTAL CHARGES'].sum(), 2),
+                'Avg Transit (hrs)': round(shipper_df['Time In Transit'].mean(), 1)
+            })
+    
+    return pd.DataFrame(shipper_metrics).sort_values('Total Shipments', ascending=False)
+
+def create_monthly_trend_chart(monthly_df: pd.DataFrame) -> go.Figure:
+    """Create monthly OTP trend chart"""
     # Create figure with secondary y-axis
     fig = make_subplots(
         rows=2, cols=1,
@@ -229,29 +278,8 @@ def create_monthly_trend_chart(df: pd.DataFrame) -> go.Figure:
     
     return fig
 
-def create_country_analysis(df: pd.DataFrame) -> go.Figure:
+def create_country_analysis(country_df: pd.DataFrame) -> go.Figure:
     """Create country-wise performance analysis"""
-    country_metrics = []
-    
-    for country in df['PU CTRY'].unique():
-        if pd.notna(country):
-            country_df = df[df['PU CTRY'] == country]
-            
-            total = len(country_df)
-            on_time = country_df['Is_On_Time'].sum()
-            otp = (on_time / total * 100) if total > 0 else 0
-            
-            country_metrics.append({
-                'Country': country,
-                'OTP %': otp,
-                'Total Shipments': total,
-                'Total Pieces': country_df['PIECES'].sum(),
-                'Total Charges': country_df['TOTAL CHARGES'].sum(),
-                'Avg Transit Time': country_df['Time In Transit'].mean()
-            })
-    
-    country_df = pd.DataFrame(country_metrics)
-    
     # Create subplots
     fig = make_subplots(
         rows=2, cols=2,
@@ -300,31 +328,7 @@ def create_country_analysis(df: pd.DataFrame) -> go.Figure:
     
     return fig
 
-def create_shipper_analysis(df: pd.DataFrame) -> pd.DataFrame:
-    """Create shipper-wise analysis table"""
-    shipper_metrics = []
-    
-    for shipper in df['SHIPPER NAME'].unique():
-        if pd.notna(shipper):
-            shipper_df = df[df['SHIPPER NAME'] == shipper]
-            
-            total = len(shipper_df)
-            on_time = shipper_df['Is_On_Time'].sum()
-            otp = (on_time / total * 100) if total > 0 else 0
-            
-            shipper_metrics.append({
-                'Shipper': shipper[:50],  # Truncate long names
-                'Total Shipments': total,
-                'On-Time': on_time,
-                'OTP %': round(otp, 1),
-                'Total Pieces': int(shipper_df['PIECES'].sum()),
-                'Total Charges ($)': round(shipper_df['TOTAL CHARGES'].sum(), 2),
-                'Avg Transit (hrs)': round(shipper_df['Time In Transit'].mean(), 1)
-            })
-    
-    return pd.DataFrame(shipper_metrics).sort_values('Total Shipments', ascending=False)
-
-def generate_executive_summary(df: pd.DataFrame, metrics: Dict) -> str:
+def generate_executive_summary(metrics: Dict) -> str:
     """Generate executive summary text"""
     summary = f"""
     ## Executive Summary
@@ -361,6 +365,12 @@ def main():
         </div>
     """, unsafe_allow_html=True)
     
+    # Initialize session state
+    if 'df_processed' not in st.session_state:
+        st.session_state.df_processed = None
+    if 'df_filtered' not in st.session_state:
+        st.session_state.df_filtered = None
+    
     # Sidebar for file upload
     with st.sidebar:
         st.markdown("### 📁 Data Upload")
@@ -371,59 +381,101 @@ def main():
         )
         
         if uploaded_file is not None:
+            # Read file once and cache it
+            file_content = uploaded_file.read()
+            
             if st.button("🔄 Process Data", type="primary"):
                 with st.spinner("Processing data..."):
-                    df = load_and_process_data(uploaded_file)
+                    df = load_and_process_data(file_content, uploaded_file.name)
                     if df is not None:
-                        st.session_state.processed_data = df
-                        st.session_state.data_loaded = True
+                        st.session_state.df_processed = df
+                        st.session_state.df_filtered = df.copy()
                         st.success("✅ Data processed successfully!")
+                        st.rerun()
         
         # Filters
-        if st.session_state.data_loaded:
+        if st.session_state.df_processed is not None:
             st.markdown("### 🔍 Filters")
-            df = st.session_state.processed_data
+            df = st.session_state.df_processed
             
             # Date range filter
             if 'POD DATE/TIME' in df.columns:
-                min_date = df['POD DATE/TIME'].min()
-                max_date = df['POD DATE/TIME'].max()
+                min_date = pd.to_datetime(df['POD DATE/TIME'].min())
+                max_date = pd.to_datetime(df['POD DATE/TIME'].max())
                 
-                date_range = st.date_input(
-                    "Select Date Range",
-                    value=(min_date, max_date),
-                    min_value=min_date,
-                    max_value=max_date
-                )
+                col1, col2 = st.columns(2)
+                with col1:
+                    start_date = st.date_input(
+                        "Start Date",
+                        value=min_date.date() if pd.notna(min_date) else None,
+                        min_value=min_date.date() if pd.notna(min_date) else None,
+                        max_value=max_date.date() if pd.notna(max_date) else None
+                    )
+                with col2:
+                    end_date = st.date_input(
+                        "End Date",
+                        value=max_date.date() if pd.notna(max_date) else None,
+                        min_value=min_date.date() if pd.notna(min_date) else None,
+                        max_value=max_date.date() if pd.notna(max_date) else None
+                    )
             
             # Country filter
+            available_countries = df['PU CTRY'].dropna().unique().tolist()
             countries = st.multiselect(
                 "Select Countries",
-                options=df['PU CTRY'].unique().tolist(),
-                default=df['PU CTRY'].unique().tolist()
+                options=available_countries,
+                default=available_countries
             )
             
+            # Shipper filter
+            available_shippers = df['SHIPPER NAME'].dropna().unique().tolist()
+            if st.checkbox("Filter by Shipper"):
+                selected_shippers = st.multiselect(
+                    "Select Shippers",
+                    options=available_shippers,
+                    default=available_shippers
+                )
+            else:
+                selected_shippers = available_shippers
+            
             # Apply filters button
-            if st.button("Apply Filters"):
+            if st.button("Apply Filters", type="secondary"):
                 # Filter data based on selections
-                filtered_df = df[df['PU CTRY'].isin(countries)]
-                if len(date_range) == 2:
+                filtered_df = df.copy()
+                
+                # Apply country filter
+                if countries:
+                    filtered_df = filtered_df[filtered_df['PU CTRY'].isin(countries)]
+                
+                # Apply date filter
+                if start_date and end_date:
                     filtered_df = filtered_df[
-                        (filtered_df['POD DATE/TIME'].dt.date >= date_range[0]) &
-                        (filtered_df['POD DATE/TIME'].dt.date <= date_range[1])
+                        (pd.to_datetime(filtered_df['POD DATE/TIME']).dt.date >= start_date) &
+                        (pd.to_datetime(filtered_df['POD DATE/TIME']).dt.date <= end_date)
                     ]
-                st.session_state.processed_data = filtered_df
+                
+                # Apply shipper filter
+                if selected_shippers:
+                    filtered_df = filtered_df[filtered_df['SHIPPER NAME'].isin(selected_shippers)]
+                
+                st.session_state.df_filtered = filtered_df
+                st.success("Filters applied!")
+                st.rerun()
+            
+            # Reset filters button
+            if st.button("Reset Filters"):
+                st.session_state.df_filtered = st.session_state.df_processed.copy()
                 st.rerun()
     
     # Main content area
-    if st.session_state.data_loaded and st.session_state.processed_data is not None:
-        df = st.session_state.processed_data
+    if st.session_state.df_filtered is not None:
+        df = st.session_state.df_filtered
         
         # Calculate metrics
         metrics = calculate_otp_metrics(df)
         
         # Executive Summary
-        st.markdown(generate_executive_summary(df, metrics))
+        st.markdown(generate_executive_summary(metrics))
         
         # Key Metrics Cards
         st.markdown("### 📈 Key Performance Indicators")
@@ -464,47 +516,58 @@ def main():
         
         with tab1:
             st.markdown("### Monthly Performance Trends")
-            fig_trend = create_monthly_trend_chart(df)
-            st.plotly_chart(fig_trend, use_container_width=True)
+            monthly_df = create_monthly_trend_data(df)
+            if not monthly_df.empty:
+                fig_trend = create_monthly_trend_chart(monthly_df)
+                st.plotly_chart(fig_trend, use_container_width=True)
+            else:
+                st.info("No monthly data available for the selected filters")
         
         with tab2:
             st.markdown("### Country-wise Performance")
-            fig_country = create_country_analysis(df)
-            st.plotly_chart(fig_country, use_container_width=True)
+            country_df = create_country_metrics(df)
+            if not country_df.empty:
+                fig_country = create_country_analysis(country_df)
+                st.plotly_chart(fig_country, use_container_width=True)
+            else:
+                st.info("No country data available for the selected filters")
         
         with tab3:
             st.markdown("### Shipper Performance Analysis")
             shipper_df = create_shipper_analysis(df)
             
-            # Display as formatted table
-            st.dataframe(
-                shipper_df,
-                use_container_width=True,
-                hide_index=True,
-                column_config={
-                    "OTP %": st.column_config.ProgressColumn(
-                        "OTP %",
-                        help="On-Time Performance Percentage",
-                        format="%.1f%%",
-                        min_value=0,
-                        max_value=100,
-                    ),
-                    "Total Charges ($)": st.column_config.NumberColumn(
-                        "Total Charges ($)",
-                        help="Total charges in USD",
-                        format="$%.2f",
-                    ),
-                }
-            )
-            
-            # Download button for shipper analysis
-            csv = shipper_df.to_csv(index=False)
-            st.download_button(
-                label="📥 Download Shipper Analysis",
-                data=csv,
-                file_name=f"shipper_analysis_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime='text/csv'
-            )
+            if not shipper_df.empty:
+                # Display as formatted table
+                st.dataframe(
+                    shipper_df,
+                    use_container_width=True,
+                    hide_index=True,
+                    column_config={
+                        "OTP %": st.column_config.ProgressColumn(
+                            "OTP %",
+                            help="On-Time Performance Percentage",
+                            format="%.1f%%",
+                            min_value=0,
+                            max_value=100,
+                        ),
+                        "Total Charges ($)": st.column_config.NumberColumn(
+                            "Total Charges ($)",
+                            help="Total charges in USD",
+                            format="$%.2f",
+                        ),
+                    }
+                )
+                
+                # Download button for shipper analysis
+                csv = shipper_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Shipper Analysis",
+                    data=csv,
+                    file_name=f"shipper_analysis_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime='text/csv'
+                )
+            else:
+                st.info("No shipper data available for the selected filters")
         
         with tab4:
             st.markdown("### Detailed Shipment Data")
@@ -530,20 +593,26 @@ def main():
             
             available_columns = [col for col in display_columns if col in detailed_df.columns]
             
-            st.dataframe(
-                detailed_df[available_columns],
-                use_container_width=True,
-                hide_index=True
-            )
-            
-            # Download full dataset
-            csv_full = detailed_df.to_csv(index=False)
-            st.download_button(
-                label="📥 Download Full Dataset",
-                data=csv_full,
-                file_name=f"otp_detailed_data_{datetime.now().strftime('%Y%m%d')}.csv",
-                mime='text/csv'
-            )
+            if not detailed_df.empty:
+                st.dataframe(
+                    detailed_df[available_columns].head(1000),  # Limit display to 1000 rows for performance
+                    use_container_width=True,
+                    hide_index=True
+                )
+                
+                # Show total rows
+                st.caption(f"Showing {min(1000, len(detailed_df))} of {len(detailed_df)} rows")
+                
+                # Download full dataset
+                csv_full = detailed_df.to_csv(index=False)
+                st.download_button(
+                    label="📥 Download Full Dataset",
+                    data=csv_full,
+                    file_name=f"otp_detailed_data_{datetime.now().strftime('%Y%m%d')}.csv",
+                    mime='text/csv'
+                )
+            else:
+                st.info("No data available for the selected filters")
     
     else:
         # Instructions when no data is loaded
