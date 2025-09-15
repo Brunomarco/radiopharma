@@ -1,16 +1,15 @@
 """
-Professional OTP Management Dashboard
-For Top Management Reporting
-Version 2.0 - Optimized Performance
+Professional OTP Management Dashboard - Complete Version
+Supports both Excel and CSV files with full functionality
+Version 3.0
 """
 
 import streamlit as st
 import pandas as pd
-import plotly.express as px
 import plotly.graph_objects as go
 from plotly.subplots import make_subplots
 import numpy as np
-from datetime import datetime, timedelta
+from datetime import datetime
 import io
 from typing import Dict, List, Tuple
 import warnings
@@ -29,13 +28,6 @@ st.markdown("""
     <style>
     .main {
         padding: 0rem 1rem;
-    }
-    .metric-card {
-        background-color: #f8f9fa;
-        border-left: 4px solid #0066cc;
-        padding: 1rem;
-        border-radius: 0.5rem;
-        margin-bottom: 1rem;
     }
     .header-style {
         background: linear-gradient(90deg, #0066cc 0%, #004499 100%);
@@ -56,139 +48,164 @@ st.markdown("""
     </style>
     """, unsafe_allow_html=True)
 
-# Cache data processing functions
+# Initialize session state
+if 'df_processed' not in st.session_state:
+    st.session_state.df_processed = None
+if 'df_filtered' not in st.session_state:
+    st.session_state.df_filtered = None
+
 @st.cache_data(show_spinner=False)
-def load_and_process_data(file_content, file_name) -> pd.DataFrame:
-    """Load and process the Excel data with proper date handling and filtering"""
+def load_file(file_content, file_name) -> pd.DataFrame:
+    """Load Excel or CSV file with robust error handling"""
     try:
-        # Read Excel file from bytes
-        df = pd.read_excel(io.BytesIO(file_content), engine='openpyxl')
+        if file_name.endswith('.csv'):
+            # Read CSV
+            df = pd.read_csv(io.BytesIO(file_content))
+        else:
+            # Try multiple methods for Excel
+            try:
+                df = pd.read_excel(io.BytesIO(file_content), engine='openpyxl')
+            except:
+                try:
+                    df = pd.read_excel(io.BytesIO(file_content), engine='xlrd')
+                except:
+                    df = pd.read_excel(io.BytesIO(file_content))
         
-        # Convert date columns to datetime
-        date_columns = ['ORD CREATE', 'READY', 'QT PU', 'ACT PU', 'READY_1', 
-                       'QT PU_1', 'PICKUP DATE/TIME', 'Depart Date / Time',
-                       'Arrive Date / Time', 'QDT', 'UPD DEL', 'POD DATE/TIME']
+        return df
+    except Exception as e:
+        st.error(f"Error loading file: {str(e)}")
+        return None
+
+@st.cache_data(show_spinner=False)
+def process_data(df: pd.DataFrame) -> pd.DataFrame:
+    """Process the data with OTP calculations"""
+    try:
+        # Convert date columns
+        date_columns = ['POD DATE/TIME', 'ORD CREATE', 'READY', 'QT PU', 'ACT PU', 
+                       'PICKUP DATE/TIME', 'Depart Date / Time', 'Arrive Date / Time']
         
         for col in date_columns:
             if col in df.columns:
                 df[col] = pd.to_datetime(df[col], errors='coerce')
         
         # Extract month from POD DATE/TIME (actual delivery date)
-        df['Delivery_Month'] = pd.to_datetime(df['POD DATE/TIME']).dt.to_period('M')
-        df['Delivery_Month_Str'] = df['Delivery_Month'].astype(str)
-        
-        # Filter for specified countries (DE, IT, IL)
-        target_countries = ['DE', 'IT', 'IL']
-        df_filtered = df[df['PU CTRY'].isin(target_countries)].copy()
+        if 'POD DATE/TIME' in df.columns:
+            df['Delivery_Month'] = pd.to_datetime(df['POD DATE/TIME']).dt.to_period('M')
+            df['Delivery_Month_Str'] = df['Delivery_Month'].astype(str)
         
         # Clean numeric columns
-        df_filtered['PIECES'] = pd.to_numeric(df_filtered['PIECES'], errors='coerce').fillna(0)
-        df_filtered['TOTAL CHARGES'] = pd.to_numeric(df_filtered['TOTAL CHARGES'], errors='coerce').fillna(0)
-        df_filtered['Time In Transit'] = pd.to_numeric(df_filtered['Time In Transit'], errors='coerce').fillna(0)
+        numeric_columns = ['PIECES', 'TOTAL CHARGES', 'Time In Transit', 'WEIGHT(KG)', 'TOT DST']
+        for col in numeric_columns:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
         
-        # Calculate OTP status (assuming 72 hours as on-time threshold)
-        df_filtered['OTP_Objective'] = 95
-        df_filtered['Is_On_Time'] = df_filtered['Time In Transit'] <= 72
+        # Calculate OTP status (72 hours threshold)
+        if 'Time In Transit' in df.columns:
+            df['Is_On_Time'] = df['Time In Transit'] <= 72
         
         # Identify controllable QC categories
-        controllable_keywords = ['Agent', 'Customs', 'Warehouse']
-        df_filtered['Is_Controllable'] = df_filtered['QC NAME'].apply(
-            lambda x: any(keyword in str(x) for keyword in controllable_keywords) if pd.notna(x) else False
-        )
+        if 'QC NAME' in df.columns:
+            controllable_keywords = ['Agent', 'Customs', 'Warehouse']
+            df['Is_Controllable'] = df['QC NAME'].apply(
+                lambda x: any(keyword in str(x) for keyword in controllable_keywords) if pd.notna(x) else False
+            )
         
-        return df_filtered
+        # Filter for target countries (DE, IT, IL)
+        if 'PU CTRY' in df.columns:
+            target_countries = ['DE', 'IT', 'IL']
+            df = df[df['PU CTRY'].isin(target_countries)].copy()
+        
+        return df
     
     except Exception as e:
         st.error(f"Error processing data: {str(e)}")
-        return None
+        return df
 
 @st.cache_data(show_spinner=False)
 def calculate_otp_metrics(df: pd.DataFrame) -> Dict:
-    """Calculate OTP Gross and Net metrics"""
+    """Calculate comprehensive OTP metrics"""
     metrics = {}
     
-    # Overall metrics
-    total_shipments = len(df)
-    on_time_shipments = df['Is_On_Time'].sum()
-    
-    # Gross OTP (all shipments)
-    metrics['gross_otp'] = (on_time_shipments / total_shipments * 100) if total_shipments > 0 else 0
-    
-    # Net OTP (only controllable)
-    controllable_df = df[df['Is_Controllable']]
-    controllable_total = len(controllable_df)
-    controllable_on_time = controllable_df['Is_On_Time'].sum()
-    metrics['net_otp'] = (controllable_on_time / controllable_total * 100) if controllable_total > 0 else 0
+    if 'Is_On_Time' in df.columns:
+        # Overall metrics
+        total_shipments = len(df)
+        on_time_shipments = df['Is_On_Time'].sum()
+        
+        # Gross OTP (all shipments)
+        metrics['gross_otp'] = (on_time_shipments / total_shipments * 100) if total_shipments > 0 else 0
+        
+        # Net OTP (only controllable)
+        if 'Is_Controllable' in df.columns:
+            controllable_df = df[df['Is_Controllable']]
+            controllable_total = len(controllable_df)
+            controllable_on_time = controllable_df['Is_On_Time'].sum() if len(controllable_df) > 0 else 0
+            metrics['net_otp'] = (controllable_on_time / controllable_total * 100) if controllable_total > 0 else 0
+            metrics['controllable_shipments'] = controllable_total
+        else:
+            metrics['net_otp'] = 0
+            metrics['controllable_shipments'] = 0
+        
+        metrics['total_shipments'] = total_shipments
+        metrics['on_time_shipments'] = on_time_shipments
+    else:
+        metrics['gross_otp'] = 0
+        metrics['net_otp'] = 0
+        metrics['total_shipments'] = len(df)
+        metrics['on_time_shipments'] = 0
+        metrics['controllable_shipments'] = 0
     
     # Additional metrics
-    metrics['total_shipments'] = total_shipments
-    metrics['on_time_shipments'] = on_time_shipments
-    metrics['controllable_shipments'] = controllable_total
-    metrics['total_pieces'] = df['PIECES'].sum()
-    metrics['total_charges'] = df['TOTAL CHARGES'].sum()
-    metrics['avg_transit_time'] = df['Time In Transit'].mean()
+    metrics['total_pieces'] = df['PIECES'].sum() if 'PIECES' in df.columns else 0
+    metrics['total_charges'] = df['TOTAL CHARGES'].sum() if 'TOTAL CHARGES' in df.columns else 0
+    metrics['avg_transit_time'] = df['Time In Transit'].mean() if 'Time In Transit' in df.columns else 0
     
     return metrics
 
 @st.cache_data(show_spinner=False)
-def create_monthly_trend_data(df: pd.DataFrame) -> pd.DataFrame:
-    """Prepare monthly trend data"""
+def create_monthly_analysis(df: pd.DataFrame) -> pd.DataFrame:
+    """Create monthly OTP and volume analysis"""
+    if 'Delivery_Month_Str' not in df.columns:
+        return pd.DataFrame()
+    
     monthly_data = []
     
     for month in df['Delivery_Month_Str'].unique():
         if pd.notna(month):
             month_df = df[df['Delivery_Month_Str'] == month]
             
-            # Calculate monthly OTP metrics
+            # Calculate metrics
             total = len(month_df)
-            on_time = month_df['Is_On_Time'].sum()
-            gross_otp = (on_time / total * 100) if total > 0 else 0
-            
-            # Net OTP for controllables
-            controllable_df = month_df[month_df['Is_Controllable']]
-            ctrl_total = len(controllable_df)
-            ctrl_on_time = controllable_df['Is_On_Time'].sum()
-            net_otp = (ctrl_on_time / ctrl_total * 100) if ctrl_total > 0 else 0
-            
-            monthly_data.append({
-                'Month': month,
-                'Gross OTP': gross_otp,
-                'Net OTP': net_otp,
-                'Objective': 95,
-                'Total Shipments': total,
-                'Total Pieces': month_df['PIECES'].sum(),
-                'Total Charges': month_df['TOTAL CHARGES'].sum()
-            })
+            if total > 0:
+                # Gross OTP
+                on_time = month_df['Is_On_Time'].sum() if 'Is_On_Time' in month_df.columns else 0
+                gross_otp = (on_time / total * 100)
+                
+                # Net OTP (controllables only)
+                if 'Is_Controllable' in month_df.columns:
+                    controllable_df = month_df[month_df['Is_Controllable']]
+                    ctrl_total = len(controllable_df)
+                    ctrl_on_time = controllable_df['Is_On_Time'].sum() if ctrl_total > 0 else 0
+                    net_otp = (ctrl_on_time / ctrl_total * 100) if ctrl_total > 0 else 0
+                else:
+                    net_otp = 0
+                
+                monthly_data.append({
+                    'Month': month,
+                    'Gross OTP': gross_otp,
+                    'Net OTP': net_otp,
+                    'Total Shipments': total,
+                    'Total Pieces': month_df['PIECES'].sum() if 'PIECES' in month_df.columns else 0,
+                    'Total Charges': month_df['TOTAL CHARGES'].sum() if 'TOTAL CHARGES' in month_df.columns else 0
+                })
     
-    return pd.DataFrame(monthly_data).sort_values('Month')
-
-@st.cache_data(show_spinner=False)
-def create_country_metrics(df: pd.DataFrame) -> pd.DataFrame:
-    """Calculate country-wise metrics"""
-    country_metrics = []
-    
-    for country in df['PU CTRY'].unique():
-        if pd.notna(country):
-            country_df = df[df['PU CTRY'] == country]
-            
-            total = len(country_df)
-            on_time = country_df['Is_On_Time'].sum()
-            otp = (on_time / total * 100) if total > 0 else 0
-            
-            country_metrics.append({
-                'Country': country,
-                'OTP %': otp,
-                'Total Shipments': total,
-                'Total Pieces': country_df['PIECES'].sum(),
-                'Total Charges': country_df['TOTAL CHARGES'].sum(),
-                'Avg Transit Time': country_df['Time In Transit'].mean()
-            })
-    
-    return pd.DataFrame(country_metrics)
+    return pd.DataFrame(monthly_data).sort_values('Month') if monthly_data else pd.DataFrame()
 
 @st.cache_data(show_spinner=False)
 def create_shipper_analysis(df: pd.DataFrame) -> pd.DataFrame:
-    """Create shipper-wise analysis table"""
+    """Create detailed shipper/account analysis"""
+    if 'SHIPPER NAME' not in df.columns:
+        return pd.DataFrame()
+    
     shipper_metrics = []
     
     for shipper in df['SHIPPER NAME'].unique():
@@ -196,24 +213,36 @@ def create_shipper_analysis(df: pd.DataFrame) -> pd.DataFrame:
             shipper_df = df[df['SHIPPER NAME'] == shipper]
             
             total = len(shipper_df)
-            on_time = shipper_df['Is_On_Time'].sum()
-            otp = (on_time / total * 100) if total > 0 else 0
-            
-            shipper_metrics.append({
-                'Shipper': shipper[:50],  # Truncate long names
-                'Total Shipments': total,
-                'On-Time': on_time,
-                'OTP %': round(otp, 1),
-                'Total Pieces': int(shipper_df['PIECES'].sum()),
-                'Total Charges ($)': round(shipper_df['TOTAL CHARGES'].sum(), 2),
-                'Avg Transit (hrs)': round(shipper_df['Time In Transit'].mean(), 1)
-            })
+            if total > 0:
+                metrics_dict = {
+                    'Shipper': shipper[:50],  # Truncate long names
+                    'Total Shipments': total
+                }
+                
+                if 'Is_On_Time' in shipper_df.columns:
+                    on_time = shipper_df['Is_On_Time'].sum()
+                    metrics_dict['On-Time'] = on_time
+                    metrics_dict['OTP %'] = round((on_time / total * 100), 1)
+                
+                if 'PIECES' in shipper_df.columns:
+                    metrics_dict['Total Pieces'] = int(shipper_df['PIECES'].sum())
+                
+                if 'TOTAL CHARGES' in shipper_df.columns:
+                    metrics_dict['Total Charges ($)'] = round(shipper_df['TOTAL CHARGES'].sum(), 2)
+                
+                if 'Time In Transit' in shipper_df.columns:
+                    metrics_dict['Avg Transit (hrs)'] = round(shipper_df['Time In Transit'].mean(), 1)
+                
+                shipper_metrics.append(metrics_dict)
     
-    return pd.DataFrame(shipper_metrics).sort_values('Total Shipments', ascending=False)
+    return pd.DataFrame(shipper_metrics).sort_values('Total Shipments', ascending=False) if shipper_metrics else pd.DataFrame()
 
-def create_monthly_trend_chart(monthly_df: pd.DataFrame) -> go.Figure:
-    """Create monthly OTP trend chart"""
-    # Create figure with secondary y-axis
+def create_performance_charts(monthly_df: pd.DataFrame) -> go.Figure:
+    """Create comprehensive performance charts"""
+    if monthly_df.empty:
+        return go.Figure()
+    
+    # Create subplots
     fig = make_subplots(
         rows=2, cols=1,
         subplot_titles=('OTP Performance Trend', 'Volume & Revenue Trend'),
@@ -239,27 +268,29 @@ def create_monthly_trend_chart(monthly_df: pd.DataFrame) -> go.Figure:
         row=1, col=1
     )
     
+    # Add 95% objective line
     fig.add_trace(
-        go.Scatter(x=monthly_df['Month'], y=monthly_df['Objective'],
+        go.Scatter(x=monthly_df['Month'], y=[95] * len(monthly_df),
                   name='Objective (95%)', mode='lines',
                   line=dict(color='red', width=2, dash='dash')),
         row=1, col=1
     )
     
-    # Volume & Revenue Trend
+    # Volume & Revenue
     fig.add_trace(
         go.Bar(x=monthly_df['Month'], y=monthly_df['Total Pieces'],
                name='Total Pieces', marker_color='lightblue'),
         row=2, col=1, secondary_y=False
     )
     
-    fig.add_trace(
-        go.Scatter(x=monthly_df['Month'], y=monthly_df['Total Charges'],
-                  name='Total Charges ($)', mode='lines+markers',
-                  line=dict(color='orange', width=2),
-                  marker=dict(size=8)),
-        row=2, col=1, secondary_y=True
-    )
+    if 'Total Charges' in monthly_df.columns:
+        fig.add_trace(
+            go.Scatter(x=monthly_df['Month'], y=monthly_df['Total Charges'],
+                      name='Total Charges ($)', mode='lines+markers',
+                      line=dict(color='orange', width=2),
+                      marker=dict(size=8)),
+            row=2, col=1, secondary_y=True
+        )
     
     # Update layout
     fig.update_layout(
@@ -278,8 +309,42 @@ def create_monthly_trend_chart(monthly_df: pd.DataFrame) -> go.Figure:
     
     return fig
 
-def create_country_analysis(country_df: pd.DataFrame) -> go.Figure:
-    """Create country-wise performance analysis"""
+def create_country_analysis(df: pd.DataFrame) -> go.Figure:
+    """Create country performance analysis"""
+    if 'PU CTRY' not in df.columns:
+        return go.Figure()
+    
+    country_metrics = []
+    
+    for country in df['PU CTRY'].unique():
+        if pd.notna(country):
+            country_df = df[df['PU CTRY'] == country]
+            
+            metrics_dict = {
+                'Country': country,
+                'Total Shipments': len(country_df)
+            }
+            
+            if 'Is_On_Time' in country_df.columns:
+                on_time = country_df['Is_On_Time'].sum()
+                metrics_dict['OTP %'] = (on_time / len(country_df) * 100) if len(country_df) > 0 else 0
+            
+            if 'PIECES' in country_df.columns:
+                metrics_dict['Total Pieces'] = country_df['PIECES'].sum()
+            
+            if 'TOTAL CHARGES' in country_df.columns:
+                metrics_dict['Total Charges'] = country_df['TOTAL CHARGES'].sum()
+            
+            if 'Time In Transit' in country_df.columns:
+                metrics_dict['Avg Transit Time'] = country_df['Time In Transit'].mean()
+            
+            country_metrics.append(metrics_dict)
+    
+    if not country_metrics:
+        return go.Figure()
+    
+    country_df = pd.DataFrame(country_metrics)
+    
     # Create subplots
     fig = make_subplots(
         rows=2, cols=2,
@@ -289,69 +354,46 @@ def create_country_analysis(country_df: pd.DataFrame) -> go.Figure:
                [{"type": "bar"}, {"type": "bar"}]]
     )
     
-    # OTP by Country
-    fig.add_trace(
-        go.Bar(x=country_df['Country'], y=country_df['OTP %'],
-               name='OTP %', marker_color='#0066cc',
-               text=country_df['OTP %'].round(1),
-               textposition='outside'),
-        row=1, col=1
-    )
+    # Add traces based on available data
+    if 'OTP %' in country_df.columns:
+        fig.add_trace(
+            go.Bar(x=country_df['Country'], y=country_df['OTP %'],
+                   name='OTP %', marker_color='#0066cc',
+                   text=country_df['OTP %'].round(1),
+                   textposition='outside'),
+            row=1, col=1
+        )
     
-    # Volume pie chart
-    fig.add_trace(
-        go.Pie(labels=country_df['Country'], values=country_df['Total Pieces'],
-               name='Pieces Distribution'),
-        row=1, col=2
-    )
+    if 'Total Pieces' in country_df.columns:
+        fig.add_trace(
+            go.Pie(labels=country_df['Country'], values=country_df['Total Pieces'],
+                   name='Pieces Distribution'),
+            row=1, col=2
+        )
     
-    # Revenue by Country
-    fig.add_trace(
-        go.Bar(x=country_df['Country'], y=country_df['Total Charges'],
-               name='Revenue', marker_color='green',
-               text=country_df['Total Charges'].round(0),
-               textposition='outside'),
-        row=2, col=1
-    )
+    if 'Total Charges' in country_df.columns:
+        fig.add_trace(
+            go.Bar(x=country_df['Country'], y=country_df['Total Charges'],
+                   name='Revenue', marker_color='green',
+                   text=country_df['Total Charges'].round(0),
+                   textposition='outside'),
+            row=2, col=1
+        )
     
-    # Transit Time by Country
-    fig.add_trace(
-        go.Bar(x=country_df['Country'], y=country_df['Avg Transit Time'],
-               name='Avg Transit Time', marker_color='orange',
-               text=country_df['Avg Transit Time'].round(1),
-               textposition='outside'),
-        row=2, col=2
-    )
+    if 'Avg Transit Time' in country_df.columns:
+        fig.add_trace(
+            go.Bar(x=country_df['Country'], y=country_df['Avg Transit Time'],
+                   name='Avg Transit Time', marker_color='orange',
+                   text=country_df['Avg Transit Time'].round(1),
+                   textposition='outside'),
+            row=2, col=2
+        )
     
     fig.update_layout(height=700, showlegend=False, title_text="Country Performance Analysis",
                      title_font_size=20, template='plotly_white')
     
     return fig
 
-def generate_executive_summary(metrics: Dict) -> str:
-    """Generate executive summary text"""
-    summary = f"""
-    ## Executive Summary
-    
-    ### Performance Overview
-    - **Gross OTP Performance**: {metrics['gross_otp']:.1f}% (Target: 95%)
-    - **Net OTP Performance (Controllables)**: {metrics['net_otp']:.1f}% (Target: 95%)
-    - **Total Shipments Analyzed**: {metrics['total_shipments']:,}
-    - **On-Time Deliveries**: {metrics['on_time_shipments']:,}
-    
-    ### Operational Metrics
-    - **Total Pieces Handled**: {metrics['total_pieces']:,.0f}
-    - **Total Revenue Generated**: ${metrics['total_charges']:,.2f}
-    - **Average Transit Time**: {metrics['avg_transit_time']:.1f} hours
-    
-    ### Key Insights
-    - Gross OTP is {'meeting' if metrics['gross_otp'] >= 95 else 'below'} the 95% objective
-    - Controllable factors account for {metrics['controllable_shipments']} shipments
-    - {'Immediate action required on controllable factors' if metrics['net_otp'] < 95 else 'Controllable factors performing well'}
-    """
-    return summary
-
-# Main Application
 def main():
     # Header
     st.markdown("""
@@ -365,109 +407,109 @@ def main():
         </div>
     """, unsafe_allow_html=True)
     
-    # Initialize session state
-    if 'df_processed' not in st.session_state:
-        st.session_state.df_processed = None
-    if 'df_filtered' not in st.session_state:
-        st.session_state.df_filtered = None
-    
-    # Sidebar for file upload
+    # Sidebar
     with st.sidebar:
         st.markdown("### 📁 Data Upload")
+        
+        # File uploader - supports both Excel and CSV
         uploaded_file = st.file_uploader(
-            "Upload Excel File",
-            type=['xlsx', 'xls'],
-            help="Upload the shipment data Excel file"
+            "Upload Data File",
+            type=['xlsx', 'xls', 'csv'],
+            help="Upload Excel (.xlsx, .xls) or CSV file with shipment data"
         )
         
         if uploaded_file is not None:
-            # Read file once and cache it
-            file_content = uploaded_file.read()
+            # Show file info
+            file_size = uploaded_file.size / (1024 * 1024)  # MB
+            st.info(f"📄 File: {uploaded_file.name}\n📊 Size: {file_size:.2f} MB")
             
             if st.button("🔄 Process Data", type="primary"):
-                with st.spinner("Processing data..."):
-                    df = load_and_process_data(file_content, uploaded_file.name)
-                    if df is not None:
-                        st.session_state.df_processed = df
-                        st.session_state.df_filtered = df.copy()
-                        st.success("✅ Data processed successfully!")
-                        st.rerun()
+                with st.spinner("Loading and processing data..."):
+                    # Read file content
+                    file_content = uploaded_file.read()
+                    
+                    # Load file
+                    df_raw = load_file(file_content, uploaded_file.name)
+                    
+                    if df_raw is not None:
+                        # Process data
+                        df_processed = process_data(df_raw)
+                        
+                        if df_processed is not None:
+                            st.session_state.df_processed = df_processed
+                            st.session_state.df_filtered = df_processed.copy()
+                            st.success(f"✅ Processed {len(df_processed)} records successfully!")
+                            st.rerun()
         
-        # Filters
+        # Filters section
         if st.session_state.df_processed is not None:
             st.markdown("### 🔍 Filters")
             df = st.session_state.df_processed
             
-            # Date range filter
+            # Date filter
             if 'POD DATE/TIME' in df.columns:
-                min_date = pd.to_datetime(df['POD DATE/TIME'].min())
-                max_date = pd.to_datetime(df['POD DATE/TIME'].max())
+                date_min = pd.to_datetime(df['POD DATE/TIME'].min())
+                date_max = pd.to_datetime(df['POD DATE/TIME'].max())
                 
-                col1, col2 = st.columns(2)
-                with col1:
-                    start_date = st.date_input(
-                        "Start Date",
-                        value=min_date.date() if pd.notna(min_date) else None,
-                        min_value=min_date.date() if pd.notna(min_date) else None,
-                        max_value=max_date.date() if pd.notna(max_date) else None
-                    )
-                with col2:
-                    end_date = st.date_input(
-                        "End Date",
-                        value=max_date.date() if pd.notna(max_date) else None,
-                        min_value=min_date.date() if pd.notna(min_date) else None,
-                        max_value=max_date.date() if pd.notna(max_date) else None
+                if pd.notna(date_min) and pd.notna(date_max):
+                    date_range = st.date_input(
+                        "Date Range",
+                        value=(date_min.date(), date_max.date()),
+                        min_value=date_min.date(),
+                        max_value=date_max.date()
                     )
             
             # Country filter
-            available_countries = df['PU CTRY'].dropna().unique().tolist()
-            countries = st.multiselect(
-                "Select Countries",
-                options=available_countries,
-                default=available_countries
-            )
+            if 'PU CTRY' in df.columns:
+                countries = st.multiselect(
+                    "Countries",
+                    options=sorted(df['PU CTRY'].dropna().unique()),
+                    default=sorted(df['PU CTRY'].dropna().unique())
+                )
             
             # Shipper filter
-            available_shippers = df['SHIPPER NAME'].dropna().unique().tolist()
-            if st.checkbox("Filter by Shipper"):
-                selected_shippers = st.multiselect(
-                    "Select Shippers",
-                    options=available_shippers,
-                    default=available_shippers
-                )
-            else:
-                selected_shippers = available_shippers
+            if 'SHIPPER NAME' in df.columns:
+                if st.checkbox("Filter by Shipper"):
+                    shippers = st.multiselect(
+                        "Shippers",
+                        options=sorted(df['SHIPPER NAME'].dropna().unique()),
+                        default=sorted(df['SHIPPER NAME'].dropna().unique())
+                    )
+                else:
+                    shippers = df['SHIPPER NAME'].dropna().unique()
             
-            # Apply filters button
-            if st.button("Apply Filters", type="secondary"):
-                # Filter data based on selections
-                filtered_df = df.copy()
-                
-                # Apply country filter
-                if countries:
-                    filtered_df = filtered_df[filtered_df['PU CTRY'].isin(countries)]
-                
-                # Apply date filter
-                if start_date and end_date:
-                    filtered_df = filtered_df[
-                        (pd.to_datetime(filtered_df['POD DATE/TIME']).dt.date >= start_date) &
-                        (pd.to_datetime(filtered_df['POD DATE/TIME']).dt.date <= end_date)
-                    ]
-                
-                # Apply shipper filter
-                if selected_shippers:
-                    filtered_df = filtered_df[filtered_df['SHIPPER NAME'].isin(selected_shippers)]
-                
-                st.session_state.df_filtered = filtered_df
-                st.success("Filters applied!")
-                st.rerun()
+            # Apply filters
+            col1, col2 = st.columns(2)
+            with col1:
+                if st.button("Apply Filters", type="secondary"):
+                    filtered_df = df.copy()
+                    
+                    # Apply date filter
+                    if 'POD DATE/TIME' in df.columns and 'date_range' in locals():
+                        if len(date_range) == 2:
+                            filtered_df = filtered_df[
+                                (pd.to_datetime(filtered_df['POD DATE/TIME']).dt.date >= date_range[0]) &
+                                (pd.to_datetime(filtered_df['POD DATE/TIME']).dt.date <= date_range[1])
+                            ]
+                    
+                    # Apply country filter
+                    if 'PU CTRY' in df.columns and 'countries' in locals():
+                        filtered_df = filtered_df[filtered_df['PU CTRY'].isin(countries)]
+                    
+                    # Apply shipper filter
+                    if 'SHIPPER NAME' in df.columns and 'shippers' in locals():
+                        filtered_df = filtered_df[filtered_df['SHIPPER NAME'].isin(shippers)]
+                    
+                    st.session_state.df_filtered = filtered_df
+                    st.success("Filters applied!")
+                    st.rerun()
             
-            # Reset filters button
-            if st.button("Reset Filters"):
-                st.session_state.df_filtered = st.session_state.df_processed.copy()
-                st.rerun()
+            with col2:
+                if st.button("Reset Filters"):
+                    st.session_state.df_filtered = st.session_state.df_processed.copy()
+                    st.rerun()
     
-    # Main content area
+    # Main content
     if st.session_state.df_filtered is not None:
         df = st.session_state.df_filtered
         
@@ -475,10 +517,9 @@ def main():
         metrics = calculate_otp_metrics(df)
         
         # Executive Summary
-        st.markdown(generate_executive_summary(metrics))
+        st.markdown("## Executive Summary")
         
-        # Key Metrics Cards
-        st.markdown("### 📈 Key Performance Indicators")
+        # Key metrics
         col1, col2, col3, col4 = st.columns(4)
         
         with col1:
@@ -508,36 +549,49 @@ def main():
             st.metric(
                 label="Total Revenue",
                 value=f"${metrics['total_charges']:,.0f}",
-                delta=f"{metrics['total_pieces']:.0f} Pieces"
+                delta=f"{int(metrics['total_pieces'])} Pieces"
             )
         
-        # Tabs for different views
-        tab1, tab2, tab3, tab4 = st.tabs(["📊 Trends", "🌍 Country Analysis", "📦 Shipper Analysis", "📋 Detailed Data"])
+        # Performance insights
+        st.markdown("### 📊 Performance Insights")
+        if metrics['gross_otp'] < 95:
+            st.warning(f"⚠️ Gross OTP is {95 - metrics['gross_otp']:.1f}% below target")
+        else:
+            st.success(f"✅ Gross OTP is meeting the 95% objective")
+        
+        if metrics['net_otp'] < 95 and metrics['controllable_shipments'] > 0:
+            st.warning(f"⚠️ Controllable factors need attention - Net OTP at {metrics['net_otp']:.1f}%")
+        
+        # Tabs
+        tab1, tab2, tab3, tab4 = st.tabs(["📈 Trends", "🌍 Country Analysis", "📦 Shipper Analysis", "📋 Detailed Data"])
         
         with tab1:
             st.markdown("### Monthly Performance Trends")
-            monthly_df = create_monthly_trend_data(df)
+            monthly_df = create_monthly_analysis(df)
+            
             if not monthly_df.empty:
-                fig_trend = create_monthly_trend_chart(monthly_df)
-                st.plotly_chart(fig_trend, use_container_width=True)
+                fig = create_performance_charts(monthly_df)
+                st.plotly_chart(fig, use_container_width=True)
+                
+                # Monthly data table
+                with st.expander("View Monthly Data"):
+                    st.dataframe(monthly_df, use_container_width=True)
             else:
-                st.info("No monthly data available for the selected filters")
+                st.info("Monthly trend analysis requires POD DATE/TIME column")
         
         with tab2:
-            st.markdown("### Country-wise Performance")
-            country_df = create_country_metrics(df)
-            if not country_df.empty:
-                fig_country = create_country_analysis(country_df)
+            st.markdown("### Country Performance Analysis")
+            fig_country = create_country_analysis(df)
+            if fig_country.data:
                 st.plotly_chart(fig_country, use_container_width=True)
             else:
-                st.info("No country data available for the selected filters")
+                st.info("Country analysis requires PU CTRY column")
         
         with tab3:
             st.markdown("### Shipper Performance Analysis")
             shipper_df = create_shipper_analysis(df)
             
             if not shipper_df.empty:
-                # Display as formatted table
                 st.dataframe(
                     shipper_df,
                     use_container_width=True,
@@ -545,115 +599,97 @@ def main():
                     column_config={
                         "OTP %": st.column_config.ProgressColumn(
                             "OTP %",
-                            help="On-Time Performance Percentage",
+                            help="On-Time Performance",
                             format="%.1f%%",
                             min_value=0,
                             max_value=100,
-                        ),
+                        ) if "OTP %" in shipper_df.columns else None,
                         "Total Charges ($)": st.column_config.NumberColumn(
                             "Total Charges ($)",
-                            help="Total charges in USD",
                             format="$%.2f",
-                        ),
+                        ) if "Total Charges ($)" in shipper_df.columns else None,
                     }
                 )
                 
-                # Download button for shipper analysis
+                # Download shipper analysis
                 csv = shipper_df.to_csv(index=False)
                 st.download_button(
-                    label="📥 Download Shipper Analysis",
+                    "📥 Download Shipper Analysis",
                     data=csv,
                     file_name=f"shipper_analysis_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime='text/csv'
+                    mime="text/csv"
                 )
             else:
-                st.info("No shipper data available for the selected filters")
+                st.info("Shipper analysis requires SHIPPER NAME column")
         
         with tab4:
             st.markdown("### Detailed Shipment Data")
             
-            # Display options
-            col1, col2 = st.columns(2)
+            # Filtering options
+            col1, col2, col3 = st.columns(3)
             with col1:
-                show_controllables = st.checkbox("Show only controllables", value=False)
+                show_controllables = st.checkbox("Show only controllables")
             with col2:
-                show_delays = st.checkbox("Show only delays", value=False)
+                show_delays = st.checkbox("Show only delays")
+            with col3:
+                max_rows = st.number_input("Max rows to display", min_value=100, max_value=5000, value=500)
             
-            # Filter detailed data
-            detailed_df = df.copy()
-            if show_controllables:
-                detailed_df = detailed_df[detailed_df['Is_Controllable']]
-            if show_delays:
-                detailed_df = detailed_df[~detailed_df['Is_On_Time']]
+            # Apply detail filters
+            detail_df = df.copy()
+            if show_controllables and 'Is_Controllable' in detail_df.columns:
+                detail_df = detail_df[detail_df['Is_Controllable']]
+            if show_delays and 'Is_On_Time' in detail_df.columns:
+                detail_df = detail_df[~detail_df['Is_On_Time']]
+            
+            # Display data
+            st.info(f"Showing {min(len(detail_df), max_rows)} of {len(detail_df)} records")
             
             # Select columns to display
-            display_columns = ['REFER', 'SHIPPER NAME', 'PU CTRY', 'DEL CTRY', 
-                              'POD DATE/TIME', 'Time In Transit', 'Is_On_Time',
-                              'QC NAME', 'Is_Controllable', 'PIECES', 'TOTAL CHARGES']
+            available_cols = detail_df.columns.tolist()
+            priority_cols = ['REFER', 'SHIPPER NAME', 'PU CTRY', 'DEL CTRY', 
+                           'POD DATE/TIME', 'Time In Transit', 'QC NAME', 
+                           'PIECES', 'TOTAL CHARGES']
+            display_cols = [col for col in priority_cols if col in available_cols]
             
-            available_columns = [col for col in display_columns if col in detailed_df.columns]
+            st.dataframe(detail_df[display_cols].head(max_rows), use_container_width=True)
             
-            if not detailed_df.empty:
-                st.dataframe(
-                    detailed_df[available_columns].head(1000),  # Limit display to 1000 rows for performance
-                    use_container_width=True,
-                    hide_index=True
-                )
-                
-                # Show total rows
-                st.caption(f"Showing {min(1000, len(detailed_df))} of {len(detailed_df)} rows")
-                
-                # Download full dataset
-                csv_full = detailed_df.to_csv(index=False)
-                st.download_button(
-                    label="📥 Download Full Dataset",
-                    data=csv_full,
-                    file_name=f"otp_detailed_data_{datetime.now().strftime('%Y%m%d')}.csv",
-                    mime='text/csv'
-                )
-            else:
-                st.info("No data available for the selected filters")
+            # Download full data
+            csv_full = detail_df.to_csv(index=False)
+            st.download_button(
+                "📥 Download Full Dataset",
+                data=csv_full,
+                file_name=f"otp_data_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv"
+            )
     
     else:
-        # Instructions when no data is loaded
+        # Welcome screen
         st.info("""
         ### 📌 Getting Started
         
-        1. **Upload your Excel file** using the sidebar
+        1. **Upload your data file** (Excel or CSV) using the sidebar
         2. **Click "Process Data"** to analyze the shipment data
-        3. **Apply filters** as needed to focus on specific time periods or countries
-        4. **Navigate through tabs** to explore different analytical views
+        3. **Apply filters** to focus on specific periods or segments
+        4. **Navigate tabs** to explore different views
         
-        ### 📊 Dashboard Features:
-        - **Gross OTP**: Overall on-time performance across all shipments
-        - **Net OTP**: Performance for controllable factors (Agent, Customs, Warehouse)
-        - **Monthly Trends**: Track performance over time
-        - **Country Analysis**: Compare performance across DE, IT, and IL
-        - **Shipper Analysis**: Detailed breakdown by account/shipper
+        ### 📊 Key Features:
+        - **Gross OTP**: Overall on-time performance (95% target)
+        - **Net OTP**: Controllable factors only (Agent, Customs, Warehouse)
+        - **Monthly Analysis**: Performance trends over time
+        - **Country Breakdown**: Analysis for DE, IT, IL
+        - **Shipper Analysis**: Performance by account
         
-        ### 📋 Data Requirements:
-        Your Excel file should contain columns for:
-        - POD DATE/TIME (actual delivery date)
-        - PU CTRY (pickup country)
-        - QC NAME (quality control categorization)
-        - PIECES, TOTAL CHARGES, Time In Transit
-        - SHIPPER NAME (for account analysis)
+        ### 📋 Required Columns:
+        - `POD DATE/TIME` - Actual delivery date
+        - `Time In Transit` - Transit hours
+        - `PU CTRY` - Pickup country
+        - `QC NAME` - Quality control category
+        - `PIECES` - Number of pieces
+        - `TOTAL CHARGES` - Revenue
+        - `SHIPPER NAME` - Account name
+        
+        The dashboard will adapt to available columns and show relevant analyses.
         """)
-        
-        # Sample data structure
-        with st.expander("📝 View Expected Data Format"):
-            sample_data = {
-                'REFER': ['CI 220889', 'CI 221024'],
-                'SHIPPER NAME': ['COMPANY A', 'COMPANY B'],
-                'PU CTRY': ['DE', 'IT'],
-                'DEL CTRY': ['US', 'GB'],
-                'POD DATE/TIME': ['2025-07-10', '2025-07-22'],
-                'Time In Transit': [33, 29],
-                'QC NAME': ['Agent-Delay', 'Airline-FLT delay'],
-                'PIECES': [4, 5],
-                'TOTAL CHARGES': [1500.00, 2107.79]
-            }
-            st.dataframe(pd.DataFrame(sample_data))
 
 if __name__ == "__main__":
     main()
