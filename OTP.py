@@ -3,7 +3,7 @@ import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
-import plotly.express as px
+import plotly.express as px  # used for optional pies/tables if you extend later
 
 # ---------------- Page & Style ----------------
 st.set_page_config(
@@ -13,11 +13,10 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Farben & typography (close to your images)
+# Colors & typography close to your screenshots
 NAVY = "#0b1f44"       # bars / gauge fill
 GOLD = "#f0b429"       # line / accents
 SLATE = "#334155"      # axis labels
-GRAY = "#e5e7eb"       # light gray
 CARD_BG = "#ffffff"
 
 st.markdown("""
@@ -28,7 +27,6 @@ h2 {color:#0b1f44;font-weight:700;margin-top:1.5rem;margin-bottom:.75rem;}
 .kpi {background:#fff;border:1px solid #e6e6e6;border-radius:14px;padding:14px;}
 .k-num {font-size:36px;font-weight:800;color:#0b1f44;line-height:1.0;}
 .k-cap {font-size:13px;color:#6b7280;margin-top:4px;}
-.grid-4 > div {margin-bottom:10px;}
 </style>
 """, unsafe_allow_html=True)
 
@@ -42,6 +40,7 @@ CTRL_REGEX = re.compile(r"\b(agent|del\s*agt|delivery\s*agent|customs|warehouse|
 
 # ---------------- Helpers ----------------
 def _excel_to_dt(s: pd.Series) -> pd.Series:
+    """Robust datetime: parse strings; if many NaT remain, try Excel serials."""
     out = pd.to_datetime(s, errors="coerce")
     if out.isna().mean() > 0.5:
         num = pd.to_numeric(s, errors="coerce")
@@ -50,6 +49,7 @@ def _excel_to_dt(s: pd.Series) -> pd.Series:
     return out
 
 def _get_target_series(df: pd.DataFrame) -> pd.Series | None:
+    """Prefer UPD DEL; fallback QDT."""
     if "UPD DEL" in df.columns and df["UPD DEL"].notna().any():
         return df["UPD DEL"]
     if "QDT" in df.columns:
@@ -62,7 +62,7 @@ def _kfmt(n: float) -> str:
     return f"{n:.0f}"
 
 def make_semi_gauge(title: str, value: float) -> go.Figure:
-    # Semi-donut gauge using pie; center annotation for the % value
+    """Semi-donut gauge with centered percentage."""
     v = max(0, min(100, 0 if pd.isna(value) else value))
     fig = go.Figure()
     fig.add_trace(go.Pie(
@@ -94,6 +94,7 @@ def read_file(uploaded) -> pd.DataFrame:
 
 @st.cache_data(show_spinner=False)
 def preprocess(df: pd.DataFrame) -> pd.DataFrame:
+    """Filter to 440-BILLED + DE/IT/IL, build dates, flags, month key."""
     required = ["PU CTRY", "STATUS", "POD DATE/TIME"]
     if not all(c in df.columns for c in required):
         return pd.DataFrame()
@@ -106,13 +107,16 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     if d.empty:
         return d
 
+    # Actual & target dates
     d["_adate"] = _excel_to_dt(d["POD DATE/TIME"])
     tgt = _get_target_series(d)
     d["_target"] = _excel_to_dt(tgt) if tgt is not None else pd.NaT
 
-    d["Month_Display"] = d["_adate"].dt.strftime("%b %Y")   # ex: Aug 2025
+    # Month (human-friendly, full; will not be cut)
+    d["Month_Display"] = d["_adate"].dt.strftime("%b %Y")   # e.g., Aug 2025
     d["Month_Sort"] = pd.to_datetime(d["Month_Display"], format="%b %Y", errors="coerce")
 
+    # QC controllable flag from QC NAME
     if "QC NAME" in d.columns:
         d["QC_NAME_CLEAN"] = d["QC NAME"].astype(str)
         d["Is_Controllable"] = d["QC_NAME_CLEAN"].str.contains(CTRL_REGEX, na=False)
@@ -120,15 +124,19 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
         d["QC_NAME_CLEAN"] = ""
         d["Is_Controllable"] = False
 
+    # On-time (gross)
     ok = d["_adate"].notna() & d["_target"].notna()
     d["On_Time_Gross"] = False
     d.loc[ok, "On_Time_Gross"] = d.loc[ok, "_adate"] <= d.loc[ok, "_target"]
+
+    # Net marks NON-controllable lates as on-time
     d["Late"] = ~d["On_Time_Gross"]
     d["On_Time_Net"] = d["On_Time_Gross"] | (d["Late"] & ~d["Is_Controllable"])
 
     return d
 
 def calc_summary(df: pd.DataFrame):
+    """Gross/Net %, plus late exception split for tiles."""
     valid = df.dropna(subset=["_adate", "_target"])
     total_ship = int(len(valid))
     gross = valid["On_Time_Gross"].mean() * 100 if total_ship else np.nan
@@ -142,12 +150,13 @@ def calc_summary(df: pd.DataFrame):
     controllables = int(late_df["Is_Controllable"].sum())
     uncontrollables = int(exceptions - controllables)
 
-    return round(gross, 2) if pd.notna(gross) else np.nan, \
-           round(net, 2) if pd.notna(net) else np.nan, \
-           total_ship, exceptions, controllables, uncontrollables
+    return (round(gross, 2) if pd.notna(gross) else np.nan,
+            round(net, 2) if pd.notna(net) else np.nan,
+            total_ship, exceptions, controllables, uncontrollables)
 
 @st.cache_data(show_spinner=False)
 def monthly_net_otp(df: pd.DataFrame) -> pd.DataFrame:
+    """Monthly volume + Net OTP (%)."""
     valid = df.dropna(subset=["_adate", "_target"])
     if valid.empty:
         return pd.DataFrame(columns=["Month_Display","Volume","Net_OTP","Month_Sort"])
@@ -189,10 +198,10 @@ mv = monthly_net_otp(df)
 left, right = st.columns([1, 1.4])
 
 with left:
-    st.markdown('<div class="kpi"><div class="k-num">{:,}</div><div class="k-cap">Volume</div></div>'.format(total_ship), unsafe_allow_html=True)
-    st.markdown('<div class="kpi"><div class="k-num">{:,}</div><div class="k-cap">Exceptions Count</div></div>'.format(exceptions), unsafe_allow_html=True)
-    st.markdown('<div class="kpi"><div class="k-num">{:,}</div><div class="k-cap">Controllables</div></div>'.format(controllables), unsafe_allow_html=True)
-    st.markdown('<div class="kpi"><div class="k-num">{:,}</div><div class="k-cap">Uncontrollables</div></div>'.format(uncontrollables), unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi"><div class="k-num">{total_ship:,}</div><div class="k-cap">Volume</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi"><div class="k-num">{exceptions:,}</div><div class="k-cap">Exceptions Count</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi"><div class="k-num">{controllables:,}</div><div class="k-cap">Controllables</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi"><div class="k-num">{uncontrollables:,}</div><div class="k-cap">Uncontrollables</div></div>', unsafe_allow_html=True)
 
 with right:
     g1, g2, g3 = st.columns(3)
@@ -209,38 +218,49 @@ st.markdown("---")
 st.subheader("Controllable OTP by Volume")
 
 if not mv.empty:
+    # Robust labels & data types for Plotly
+    x_labels = mv["Month_Display"].astype(str).tolist()
+    vol_vals = mv["Volume"].astype(float).tolist()
+    net_vals = mv["Net_OTP"].astype(float).tolist()
+
     fig = go.Figure()
 
-    # Bars for Volume (navy) with K-labels on top
+    # Bars = monthly volume (navy) with K-labels on top
     fig.add_trace(go.Bar(
-        x=mv["Month_Display"],
-        y=mv["Volume"],
+        x=x_labels,
+        y=vol_vals,
         name="Volume",
         marker_color=NAVY,
-        text=[_kfmt(v) for v in mv["Volume"]],
+        text=[_kfmt(v) for v in vol_vals],
         textposition="outside",
         textfont=dict(size=12, color="#4b5563"),
         yaxis="y"
     ))
 
-    # Net OTP line (gold) with % labels
+    # Line = Net OTP % (gold) with % labels
     fig.add_trace(go.Scatter(
-        x=mv["Month_Display"],
-        y=mv["Net_OTP"],
+        x=x_labels,
+        y=net_vals,
         name="Controllable OTP",
         mode="lines+markers+text",
         line=dict(color=GOLD, width=3),
         marker=dict(size=8),
-        text=[f"{v:.2f}%" for v in mv["Net_OTP"]],
+        text=[f"{v:.2f}%" for v in net_vals],
         textposition="middle center",
         textfont=dict(size=11, color="#111827"),
         yaxis="y2"
     ))
 
-    # Target line on secondary axis
-    fig.add_hline(y=otp_target, line_dash="dash", line_color="red", yref="y2")
+    # Target line on secondary axis (version-safe)
+    try:
+        fig.add_hline(y=float(otp_target), line_dash="dash", line_color="red", yref="y2")
+    except Exception:
+        fig.add_shape(
+            type="line", x0=-0.5, x1=len(x_labels)-0.5,
+            y0=float(otp_target), y1=float(otp_target),
+            xref="x", yref="y2", line=dict(color="red", dash="dash")
+        )
 
-    # Layout: keep months fully visible
     fig.update_layout(
         height=460,
         hovermode="x unified",
@@ -250,27 +270,25 @@ if not mv.empty:
         xaxis=dict(
             title="",
             tickangle=-30,
-            tickfont=dict(size=12, color=SLATE),
-            automargin=True,
-            categoryorder="array",
-            categoryarray=list(mv["Month_Display"])
+            tickmode="array",
+            tickvals=x_labels,
+            ticktext=x_labels,
+            automargin=True
         ),
         yaxis=dict(
             title="Volume",
-            titlefont=dict(size=12, color=SLATE),
-            tickfont=dict(size=12, color=SLATE),
+            side="left",
             gridcolor="#f3f4f6"
         ),
         yaxis2=dict(
             title="Controllable OTP",
-            titlefont=dict(size=12, color=SLATE),
-            tickfont=dict(size=12, color=SLATE),
             overlaying="y",
             side="right",
-            range=[0, 105],
-            gridcolor="rgba(0,0,0,0)"
-        )
+            range=[0, 105]
+        ),
+        barmode="overlay"
     )
+
     st.plotly_chart(fig, use_container_width=True)
 else:
     st.info("No monthly data available.")
@@ -280,9 +298,7 @@ st.markdown("---")
 # ---------------- QC NAME split (Controllable vs Non-Controllable) ----------------
 st.subheader("QC NAME — Classification")
 if "QC_NAME_CLEAN" in df.columns:
-    qc = df.dropna(subset=["QC_NAME_CLEAN"]).copy()
-    # Only late shipments for issue split? You may choose either.
-    # Here we show ALL QC NAME occurrences, plus a Late-only tab for analysis.
+    qc = df[df["QC_NAME_CLEAN"].ne("")].copy()
     qc["Control Type"] = np.where(qc["QC_NAME_CLEAN"].str.contains(CTRL_REGEX, na=False),
                                   "Controllable", "Non-Controllable")
 
@@ -305,9 +321,9 @@ if "QC_NAME_CLEAN" in df.columns:
     with tab_late:
         st.dataframe(qc_late, use_container_width=True)
     with tab_ctrl:
-        st.dataframe(qc_all[qc_all["Control Type"]=="Controllable"], use_container_width=True)
+        st.dataframe(qc_all[qc_all["Control Type"] == "Controllable"], use_container_width=True)
     with tab_non:
-        st.dataframe(qc_all[qc_all["Control Type"]=="Non-Controllable"], use_container_width=True)
+        st.dataframe(qc_all[qc_all["Control Type"] == "Non-Controllable"], use_container_width=True)
 
     st.download_button(
         "📥 Download QC NAME (All) CSV",
@@ -324,4 +340,4 @@ if "QC_NAME_CLEAN" in df.columns:
 else:
     st.info("No QC NAME column found.")
 
-st.caption("Definitions — Gross: all shipments with POD ≤ target (UPD DEL → QDT). Net: only controllable lates (Agent / Del Agt / Delivery agent / Customs / Warehouse / W/house) count against OTP. Filters: PU CTRY ∈ {DE, IT, IL}, STATUS = 440-BILLED.")
+st.caption("Gross: POD ≤ target (UPD DEL → QDT). Net: only controllable lates (Agent / Del Agt / Delivery agent / Customs / Warehouse / W/house) count against OTP. Filters: PU CTRY ∈ {DE, IT, IL}, STATUS = 440-BILLED.")
