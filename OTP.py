@@ -1,25 +1,60 @@
-# OTP-only, fast, minimal dependencies
 import re
 import numpy as np
 import pandas as pd
 import streamlit as st
+import plotly.express as px
+import plotly.graph_objects as go
+from plotly.subplots import make_subplots
 
-st.set_page_config(page_title="Executive OTP (Fast)", layout="wide")
+st.set_page_config(page_title="Executive OTP & QC Dashboard", layout="wide")
 
-OTP_TARGET = 95.0
+OTP_TARGET_DEFAULT = 95.0
 SCOPE_PU = {"DE", "IT", "IL"}
-CTRL_KEYWORDS = ["agent", "agt", "customs", "warehouse", "w/house", "delivery agent"]
 
-st.title("Executive OTP — Fast, Minimal")
-st.caption("Scope: PU CTRY ∈ {DE, IT, IL} AND STATUS = 440-BILLED. OTP based on Actual Delivery ≤ Target.")
+# -------- Controllables mapping based on your QC NAME list --------
+# CONTROLLABLE (Agent / Customs / Delivery Agent):
+# - Del Agt-Late del, Del Agt-Late del-TFC, Delivery agent not available
+# - Customs delay, Customs delay-FDA Hold
+# NON-CONTROLLABLE:
+# - Airline-* (slow offload, FLT delay, misrouted, failure to load, no show)
+# - Consignee-Driver waiting at delivery
+# - Customer-Shipment not ready, Shipment not ready
 
-# ---------- Helpers ----------
-def excel_to_datetime(s: pd.Series) -> pd.Series:
-    out = pd.to_datetime(s, errors="coerce")
+_CONTROLLABLE_PATTERNS = [
+    r"\bdel\s*agt\b",                # Del Agt-...
+    r"\bdelivery\s*agent\b",         # Delivery agent...
+    r"\bcustoms\b",                  # Customs delay...
+    r"\bfda\s*hold\b",               # FDA hold under customs
+    # If you add warehouse-type codes later, extend with r"\bwarehouse\b|\bw/house\b"
+]
+_NONCONTROLLABLE_PATTERNS = [
+    r"\bairline\b",                  # Airline-...
+    r"\bconsignee\b",                # Consignee-...
+    r"\bcustomer\b",                 # Customer-...
+    r"(^|\b)shipment\s*not\s*ready\b" # Shipment not ready (standalone)
+]
+
+_ctrl_regex = re.compile("|".join(_CONTROLLABLE_PATTERNS), flags=re.I)
+_nonctrl_regex = re.compile("|".join(_NONCONTROLLABLE_PATTERNS), flags=re.I)
+
+def is_controllable(qc: str) -> bool:
+    s = (qc or "").strip()
+    if not s:
+        return False
+    if _ctrl_regex.search(s):
+        return True
+    if _nonctrl_regex.search(s):
+        return False
+    # Default conservative: not controllable unless clearly Agent/Customs/etc.
+    return False
+
+# ---------------- Helpers ----------------
+def excel_to_datetime(series: pd.Series) -> pd.Series:
+    """Robust datetime: parse; if many NaT remain, try Excel serial conversion."""
+    out = pd.to_datetime(series, errors="coerce")
     if out.isna().mean() > 0.5:
-        # Fallback for Excel serials
-        numeric = pd.to_numeric(s, errors="coerce")
-        out2 = pd.to_datetime("1899-12-30") + pd.to_timedelta(numeric, unit="D")
+        num = pd.to_numeric(series, errors="coerce")
+        out2 = pd.to_datetime("1899-12-30") + pd.to_timedelta(num, unit="D")
         out = out.where(~out.isna(), out2)
     return out
 
@@ -27,204 +62,264 @@ def excel_to_datetime(s: pd.Series) -> pd.Series:
 def read_uploaded(file) -> pd.DataFrame:
     name = file.name.lower()
     if name.endswith(".csv"):
-        # Read only the columns we need, case-insensitive map after read
-        df = pd.read_csv(file)
-    else:
-        # Openpyxl required for xlsx (keep in requirements if you need xlsx)
-        try:
-            df = pd.read_excel(
-                file,
-                # If you know exact headers, uncomment and adjust:
-                # usecols=["PU CTRY","STATUS","POD DATE/TIME","UPD DEL","QDT","QC NAME"]
-            )
-        except Exception:
-            df = pd.read_excel(file)  # fallback
-    return df
-
-def guess(cols, candidates):
-    low = {c.lower(): c for c in cols}
-    for c in candidates:
-        if c.lower() in low:
-            return low[c.lower()]
-    return None
+        return pd.read_csv(file)
+    return pd.read_excel(file)  # openpyxl used (see requirements)
 
 @st.cache_data(show_spinner=False)
-def preprocess(df: pd.DataFrame,
-               pu_col: str, status_col: str,
-               adate_col: str, target_col: str | None,
-               qc_col: str | None,
-               ctrl_kw: list[str]) -> pd.DataFrame:
+def preprocess(df: pd.DataFrame, target_pick: str) -> pd.DataFrame:
+    # Required columns
+    required = ["PU CTRY", "STATUS", "POD DATE/TIME"]
+    if not all(c in df.columns for c in required):
+        return pd.DataFrame()
+
     d = df.copy()
 
-    # Normalize early for speed
-    d["_pu"] = d[pu_col].astype(str).str.strip()
-    d["_status"] = d[status_col].astype(str).str.strip().str.lower()
-
-    # Scope filter first
+    # Scope filters
+    d["_pu"] = d["PU CTRY"].astype(str).str.strip()
+    d["_status"] = d["STATUS"].astype(str).str.strip().str.lower()
     d = d[d["_pu"].isin(SCOPE_PU)]
     d = d[d["_status"] == "440-billed"]
     if d.empty:
         return d
 
-    # Dates
-    d["_adate"] = excel_to_datetime(d[adate_col])
-    d["_target"] = excel_to_datetime(d[target_col]) if target_col else pd.NaT
+    # Datetime fields
+    d["_adate"] = excel_to_datetime(d["POD DATE/TIME"])
+
+    tgt_col = None
+    if target_pick == "UPD DEL" and "UPD DEL" in d.columns:
+        tgt_col = "UPD DEL"
+    elif target_pick == "QDT" and "QDT" in d.columns:
+        tgt_col = "QDT"
+    else:
+        # Auto: prefer UPD DEL, else QDT
+        if "UPD DEL" in d.columns:
+            tgt_col = "UPD DEL"
+        elif "QDT" in d.columns:
+            tgt_col = "QDT"
+
+    d["_target"] = excel_to_datetime(d[tgt_col]) if tgt_col else pd.NaT
+
+    # Month fields
     d["_month"] = d["_adate"].dt.to_period("M").dt.to_timestamp()
+    d["Month_Display"] = d["_adate"].dt.strftime("%b %Y")
+    d["Month_Sort"] = pd.to_datetime(d["Month_Display"], format="%b %Y", errors="coerce")
 
     # Controllables
-    if qc_col:
-        pattern = "|".join(re.escape(k) for k in ctrl_kw) if ctrl_kw else r"$."
-        d["_is_ctrl"] = d[qc_col].astype(str).str.lower().str.contains(pattern, regex=True, na=False)
-    else:
-        d["_is_ctrl"] = False
+    d["Is_Controllable"] = d.get("QC NAME", pd.Series("", index=d.index)).astype(str).apply(is_controllable)
 
-    # OTP flag
-    d["_on_time"] = False
-    mask = d["_adate"].notna() & d["_target"].notna()
-    d.loc[mask, "_on_time"] = d.loc[mask, "_adate"] <= d.loc[mask, "_target"]
+    # OTP flag: POD <= Target
+    ok = d["_adate"].notna() & d["_target"].notna()
+    d["On_Time"] = False
+    d.loc[ok, "On_Time"] = d.loc[ok, "_adate"] <= d.loc[ok, "_target"]
 
     return d
 
 @st.cache_data(show_spinner=False)
-def compute_otp_monthly(d: pd.DataFrame):
-    d = d.dropna(subset=["_month"])
-    gross = d.groupby("_month", as_index=False).agg(
-        On_Time=("_on_time", "sum"),
-        Total=("_on_time", "count"),
+def monthly_otp(df: pd.DataFrame) -> pd.DataFrame:
+    if df.empty:
+        return pd.DataFrame()
+    m = df.groupby("Month_Display", as_index=False).agg(
+        On_Time=("On_Time", "sum"),
+        Total=("On_Time", "count")
     )
-    gross["Gross_OTP_%"] = (gross["On_Time"] / gross["Total"] * 100).round(1)
-
-    dn = d[d["_is_ctrl"]]
-    if dn.empty:
-        net = pd.DataFrame(columns=["_month", "On_Time", "Total", "Net_OTP_%"])
-    else:
-        net = dn.groupby("_month", as_index=False).agg(
-            On_Time=("_on_time", "sum"),
-            Total=("_on_time", "count"),
+    dn = df[df["Is_Controllable"] == True]
+    if not dn.empty:
+        n = dn.groupby("Month_Display", as_index=False).agg(
+            Net_On_Time=("On_Time", "sum"),
+            Net_Total=("On_Time", "count")
         )
-        net["Net_OTP_%"] = (net["On_Time"] / net["Total"] * 100).round(1)
-    return gross, net
+        m = m.merge(n, on="Month_Display", how="left")
+    else:
+        m["Net_On_Time"] = np.nan
+        m["Net_Total"] = np.nan
 
-def status_cls(pct, target=OTP_TARGET):
-    if pd.isna(pct): return "bad"
-    if pct >= target: return "ok"
-    if pct >= target - 5: return "warn"
-    return "bad"
+    m["Gross_OTP"] = (m["On_Time"] / m["Total"] * 100).round(1)
+    m["Net_OTP"] = (m["Net_On_Time"] / m["Net_Total"] * 100).round(1)
+    m["Month_Sort"] = pd.to_datetime(m["Month_Display"], format="%b %Y", errors="coerce")
+    return m.sort_values("Month_Sort")
 
-st.markdown("""
-<style>
-.kpi-card {padding:1rem;border:1px solid #e6e6e6;border-radius:14px}
-.kpi-title {font-size:.9rem;color:#5a5a5a}
-.kpi-value {font-size:1.6rem;font-weight:700}
-.ok{color:#0b8a42}.warn{color:#b26a00}.bad{color:#b00020}
-</style>
-""", unsafe_allow_html=True)
+# ---------------- UI: Upload & Settings ----------------
+st.title("Executive OTP & Quality Control Dashboard")
+st.caption("Filters: PU CTRY ∈ {DE, IT, IL} and STATUS = 440-BILLED")
 
-# ---------- UI ----------
 with st.sidebar:
-    st.header("Upload")
-    up = st.file_uploader("Upload .xlsx or .csv", type=["xlsx", "csv"])
-    st.caption("Faster if you upload CSV.")
+    up = st.file_uploader("Upload Excel (.xlsx) or CSV", type=["xlsx", "csv"])
+    target_pick = st.selectbox("Target/Promised Date column",
+                               options=["Auto (UPD DEL→QDT)", "UPD DEL", "QDT"])
+    otp_target = st.number_input("OTP Target (%)", min_value=0, max_value=100,
+                                 value=int(OTP_TARGET_DEFAULT), step=1)
 
 if not up:
-    st.info("Upload a file to begin.")
+    st.info("Upload your Excel/CSV file to begin.")
     st.stop()
 
-# Read
-df = read_uploaded(up)
+df_raw = read_uploaded(up)
+df = preprocess(df_raw, target_pick)
 if df.empty:
-    st.error("Uploaded file is empty.")
+    st.error("No rows after filtering or required columns missing. "
+             "Ensure the file has PU CTRY, STATUS, POD DATE/TIME, and UPD DEL or QDT.")
     st.stop()
 
-cols = list(df.columns)
+# ------------- Overall KPIs -------------
+total_shipments = len(df)
+gross_otp_overall = (df["On_Time"].sum() / total_shipments * 100) if total_shipments else np.nan
+ctrl_df = df[df["Is_Controllable"] == True]
+net_otp_overall = (ctrl_df["On_Time"].sum() / len(ctrl_df) * 100) if len(ctrl_df) else np.nan
 
-# Mapping (auto-guessed)
-pu_col     = guess(cols, ["PU CTRY", "PU Country", "Pickup Country", "PU Country Code"]) or st.selectbox("PU CTRY", cols)
-status_col = guess(cols, ["STATUS", "Status"]) or st.selectbox("STATUS", cols)
-adate_col  = guess(cols, ["POD DATE/TIME", "Actual Delivery Date", "Delivery Actual", "POD Date"]) or st.selectbox("Actual Delivery", cols)
-target_col_guess = guess(cols, ["UPD DEL", "QDT", "Promised Date", "Target Delivery"])
-qc_col_guess     = guess(cols, ["QC NAME", "QC name", "QC", "QC Category", "Exception Category"])
-
-with st.sidebar:
-    st.header("Column Mapping")
-    pu_col = st.selectbox("Pickup Country (PU)", options=cols, index=cols.index(pu_col) if pu_col in cols else 0)
-    status_col = st.selectbox("STATUS", options=cols, index=cols.index(status_col) if status_col in cols else 0)
-    adate_col = st.selectbox("Actual Delivery (POD)", options=cols, index=cols.index(adate_col) if adate_col in cols else 0)
-    target_col = st.selectbox("Target/Promised Delivery", options=["— none —"] + cols,
-                              index=0 if not target_col_guess else (["— none —"] + cols).index(target_col_guess))
-    qc_col = st.selectbox("QC Name (for controllables)", options=["— none —"] + cols,
-                          index=0 if not qc_col_guess else (["— none —"] + cols).index(qc_col_guess))
-    ctrl_txt = st.text_input("Controllable keywords", value="agent,agt,customs,warehouse,w/house,delivery agent")
-    otp_target = st.number_input("OTP Target %", 0, 100, int(OTP_TARGET), 1)
-
-target_col = None if target_col == "— none —" else target_col
-qc_col = None if qc_col == "— none —" else qc_col
-ctrl_kw = [w.strip().lower() for w in ctrl_txt.split(",") if w.strip()]
-
-# Preprocess + compute
-d = preprocess(df, pu_col, status_col, adate_col, target_col, qc_col, ctrl_kw)
-if d.empty:
-    st.error("No rows after filtering (PU in DE/IT/IL & STATUS=440-BILLED). Check mappings/data.")
-    st.stop()
-
-gross, net = compute_otp_monthly(d)
-
-# KPIs
-latest = gross["_month"].max() if not gross.empty else None
-gross_latest = float(gross.loc[gross["_month"]==latest, "Gross_OTP_%"].iloc[0]) if latest is not None else np.nan
-
-latest_net = net["_month"].max() if not net.empty else None
-net_latest = float(net.loc[net["_month"]==latest_net, "Net_OTP_%"].iloc[0]) if latest_net is not None else np.nan
-
-c1, c2 = st.columns(2)
-with c1:
-    txt = "" if pd.isna(gross_latest) else f"{gross_latest:.1f}%"
-    st.markdown('<div class="kpi-card">', unsafe_allow_html=True)
-    st.markdown('<div class="kpi-title">Gross OTP (latest month)</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="kpi-value {status_cls(gross_latest, otp_target)}">{txt}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="kpi-title">Objective: {otp_target:.0f}%</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
-
-with c2:
-    txt = "" if pd.isna(net_latest) else f"{net_latest:.1f}%"
-    st.markdown('<div class="kpi-card">', unsafe_allow_html=True)
-    st.markdown('<div class="kpi-title">Net OTP (Controllables, latest month)</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="kpi-value">{txt}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="kpi-title">QC includes: {", ".join(ctrl_kw) if ctrl_kw else "—"}</div>', unsafe_allow_html=True)
-    st.markdown('</div>', unsafe_allow_html=True)
+monthly = monthly_otp(df)
 
 st.markdown("---")
+c1, c2 = st.columns(2)
 
-# Trend charts (native Streamlit charts)
-st.subheader("OTP Trend — Gross (Actual Delivery Month)")
-if not gross.empty:
-    gross_chart = gross.set_index("_month")[["Gross_OTP_%"]]
-    st.line_chart(gross_chart)
+with c1:
+    st.subheader("📊 OTP Summary (Latest Month)")
+    latest_m = monthly["Month_Sort"].max() if not monthly.empty else None
+    if latest_m is not None:
+        last = monthly.loc[monthly["Month_Sort"] == latest_m].iloc[0]
+        gross_last = last["Gross_OTP"]
+        net_last = last["Net_OTP"]
+
+        st.metric("Gross OTP (Latest)",
+                  f"{gross_last:.1f}%" if pd.notna(gross_last) else "—",
+                  f"{(gross_last - otp_target):.1f}% vs target" if pd.notna(gross_last) else None,
+                  delta_color="normal" if pd.notna(gross_last) and gross_last >= otp_target else "inverse")
+
+        st.metric("Net OTP (Latest)",
+                  f"{net_last:.1f}%" if pd.notna(net_last) else "—",
+                  f"{(net_last - otp_target):.1f}% vs target" if pd.notna(net_last) else None,
+                  delta_color="normal" if pd.notna(net_last) and net_last >= otp_target else "inverse")
+    else:
+        st.info("No monthly OTP could be computed; check delivery/target dates.")
+
+with c2:
+    # 🎯 OTP Performance Analysis (Gross vs Net vs Controllable Impact)
+    st.subheader("🎯 OTP Performance Analysis")
+    impact = (net_otp_overall - gross_otp_overall) if (pd.notna(net_otp_overall) and pd.notna(gross_otp_overall)) else np.nan
+    otp_breakdown = pd.DataFrame({
+        "Category": ["Gross OTP", "Net OTP", "Controllable Impact"],
+        "Value": [
+            gross_otp_overall if pd.notna(gross_otp_overall) else 0.0,
+            net_otp_overall if pd.notna(net_otp_overall) else 0.0,
+            impact if pd.notna(impact) else 0.0
+        ],
+        "Type": ["Actual", "Adjusted", "Opportunity"]
+    })
+
+    fig_otp = go.Figure()
+    colors = ['#3b82f6', '#10b981', '#fbbf24']
+    for i, row in otp_breakdown.iterrows():
+        fig_otp.add_trace(go.Bar(
+            x=[row['Value']],
+            y=[row['Category']],
+            orientation='h',
+            name=row['Category'],
+            marker_color=colors[i],
+            text=f"{row['Value']:.1f}%",
+            textposition='outside',
+            showlegend=False
+        ))
+    fig_otp.update_layout(
+        height=400,
+        xaxis_title="Percentage (%)",
+        yaxis_title="",
+        xaxis=dict(range=[0, 105]),
+        barmode='overlay'
+    )
+    fig_otp.add_vline(x=otp_target, line_dash="dash", line_color="red")
+    st.plotly_chart(fig_otp, use_container_width=True)
+
+# ------------- Trend Chart -------------
+st.markdown("---")
+st.subheader("📈 OTP Trend by Month")
+if not monthly.empty:
+    fig_trend = make_subplots(specs=[[{"secondary_y": False}]])
+    fig_trend.add_trace(go.Scatter(
+        x=monthly["Month_Display"], y=monthly["Gross_OTP"],
+        mode="lines+markers", name="Gross OTP",
+        line=dict(width=3, color="#3b82f6")
+    ))
+    if monthly["Net_OTP"].notna().any():
+        fig_trend.add_trace(go.Scatter(
+            x=monthly["Month_Display"], y=monthly["Net_OTP"],
+            mode="lines+markers", name="Net OTP",
+            line=dict(width=3, color="#10b981")
+        ))
+    fig_trend.add_hline(y=otp_target, line_dash="dash", line_color="red",
+                        annotation_text=f"Target {otp_target:.0f}%")
+    fig_trend.update_layout(height=420, yaxis_title="OTP (%)", xaxis_title="Month", hovermode="x unified")
+    st.plotly_chart(fig_trend, use_container_width=True)
 else:
-    st.info("No Gross OTP data.")
+    st.info("No monthly OTP available to chart.")
 
-st.subheader("OTP Trend — Net (Controllables)")
-if not net.empty:
-    net_chart = net.set_index("_month")[["Net_OTP_%"]]
-    st.line_chart(net_chart)
+# ------------- QC Analysis -------------
+st.markdown("---")
+st.subheader("🔧 Quality Control Issues Analysis")
+if ("QCCODE" in df.columns) and ("QC NAME" in df.columns):
+    qc_data = df[df["QCCODE"].notna()].copy()
+    if len(qc_data) > 0:
+        # Tag issues by controllability using classifier
+        qc_data["Issue_Type"] = np.where(
+            qc_data["QC NAME"].astype(str).apply(is_controllable),
+            "Controllable (Internal)",
+            "Non-Controllable (External)"
+        )
+
+        colA, colB = st.columns(2)
+        with colA:
+            st.markdown("#### Distribution by Control Type")
+            type_counts = qc_data["Issue_Type"].value_counts()
+            fig_qc_pie = px.pie(
+                values=type_counts.values,
+                names=type_counts.index,
+                hole=0.4,
+                color=type_counts.index,
+                color_discrete_map={
+                    "Controllable (Internal)": "#10b981",
+                    "Non-Controllable (External)": "#ef4444"
+                }
+            )
+            fig_qc_pie.update_traces(textposition='inside', textinfo='percent+label')
+            fig_qc_pie.update_layout(height=350)
+            st.plotly_chart(fig_qc_pie, use_container_width=True)
+
+            c1a, c1b = st.columns(2)
+            with c1a:
+                controllable_pct = (type_counts.get("Controllable (Internal)", 0) / len(qc_data) * 100) if len(qc_data) else 0
+                st.metric("🟢 Controllable", f"{controllable_pct:.1f}%")
+            with c1b:
+                non_controllable_pct = (type_counts.get("Non-Controllable (External)", 0) / len(qc_data) * 100) if len(qc_data) else 0
+                st.metric("🔴 Non-Controllable", f"{non_controllable_pct:.1f}%")
+
+        with colB:
+            st.markdown("#### Top 10 Quality Control Issues")
+            qc_counts = qc_data.groupby(["QC NAME", "Issue_Type"]).size().reset_index(name="Count")
+            qc_counts = qc_counts.sort_values("Count", ascending=False).head(10)
+            qc_counts_sorted = qc_counts.sort_values("Count", ascending=True)
+
+            fig_qc_bar = px.bar(
+                qc_counts_sorted,
+                x="Count", y="QC NAME",
+                orientation="h",
+                color="Issue_Type",
+                text="Count",
+                color_discrete_map={
+                    "Controllable (Internal)": "#10b981",
+                    "Non-Controllable (External)": "#ef4444"
+                }
+            )
+            fig_qc_bar.update_traces(texttemplate='%{text}', textposition='outside')
+            fig_qc_bar.update_layout(
+                height=350,
+                xaxis_title="Occurrences",
+                yaxis_title="",
+                legend_title="Issue Type",
+                legend=dict(orientation="h", yanchor="bottom", y=-0.35, x=0),
+                margin=dict(b=80)
+            )
+            st.plotly_chart(fig_qc_bar, use_container_width=True)
+    else:
+        st.info("No quality control issues found (no QCCODE rows).")
 else:
-    st.info("No Net OTP data.")
+    st.info("No QC data available (missing QCCODE and/or QC NAME columns).")
 
-# Tables + downloads
-def to_csv_bytes(df_): return df_.to_csv(index=False).encode("utf-8")
-
-st.subheader("Monthly OTP — Gross")
-if not gross.empty:
-    gross_out = gross.rename(columns={"_month":"Month","On_Time":"On_Time_Count","Total":"Total_Count"})
-    st.dataframe(gross_out, use_container_width=True)
-    st.download_button("Download Gross OTP CSV", data=to_csv_bytes(gross_out), file_name="otp_gross_by_month.csv")
-else:
-    st.info("No rows.")
-
-st.subheader("Monthly OTP — Net (Controllables)")
-if not net.empty:
-    net_out = net.rename(columns={"_month":"Month","On_Time":"On_Time_Count","Total":"Total_Count"})
-    st.dataframe(net_out, use_container_width=True)
-    st.download_button("Download Net OTP CSV", data=to_csv_bytes(net_out), file_name="otp_net_by_month.csv")
-else:
-    st.info("No controllable rows.")
+st.caption("All metrics are computed from the uploaded file only. Scope and status filters applied first.")
