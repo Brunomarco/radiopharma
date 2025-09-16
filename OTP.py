@@ -150,14 +150,18 @@ k1, k2 = st.columns(2)
 with k1:
     st.markdown('<div class="kpi">', unsafe_allow_html=True)
     st.markdown('<div class="kpi-title">Gross OTP (All Shipments)</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="kpi-val">{"" if pd.isna(gross_overall) else f"{gross_overall:.1f}%"}'</
-                f'div>', unsafe_allow_html=True)
+    st.markdown(
+    f'<div class="kpi-val">{"" if pd.isna(gross_overall) else f"{gross_overall:.1f}%"}</div>',
+    unsafe_allow_html=True
+    )
     st.markdown('</div>', unsafe_allow_html=True)
 with k2:
     st.markdown('<div class="kpi">', unsafe_allow_html=True)
     st.markdown('<div class="kpi-title">Net OTP (Controllables)</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="kpi-val">{"" if pd.isna(net_overall) else f"{net_overall:.1f}%"}'</
-                f'div>', unsafe_allow_html=True)
+    st.markdown(
+    f'<div class="kpi-val">{"" if pd.isna(net_overall) else f"{net_overall:.1f}%"}</div>',
+    unsafe_allow_html=True
+    )
     st.markdown('</div>', unsafe_allow_html=True)
 
 st.markdown("---")
