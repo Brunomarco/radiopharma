@@ -1,30 +1,9 @@
-# Core Dependencies for OTP Management Dashboard
-# Python 3.8+ recommended
+# Minimal Requirements for Fast Deployment
+# OTP Management Dashboard - Optimized Version
 
-# Web Framework
+# Core essentials only
 streamlit==1.31.1
-
-# Data Processing
 pandas==2.2.0
-numpy==1.26.3
-openpyxl==3.1.2  # For Excel file reading
-
-# Visualization
 plotly==5.19.0
-
-# Date/Time Handling (included with pandas but explicitly listed)
-python-dateutil==2.8.2
-
-# Additional utilities that may be helpful
-xlrd==2.0.1  # For older Excel formats (.xls)
-XlsxWriter==3.1.9  # For Excel export functionality
-
-# Optional: For enhanced performance with large datasets
-# pyarrow==15.0.0
-# fastparquet==2024.2.0
-
-# Optional: For deployment to Streamlit Cloud
-# These are typically auto-detected but good to specify
-click==8.1.7
-protobuf==4.25.2
-watchdog==4.0.0
+openpyxl==3.1.2
+numpy==1.26.3
