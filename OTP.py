@@ -12,12 +12,12 @@ st.set_page_config(
     initial_sidebar_state="collapsed",
 )
 
-# Colors & typography styled to your screenshots
+# Colors
 NAVY = "#0b1f44"       # bars / gauge fill
-GOLD = "#f0b429"       # line / accents
+GOLD = "#f0b429"       # net line
 BLUE = "#1f77b4"       # gross line
-GREEN = "#10b981"      # net line
-SLATE = "#334155"      # axis labels
+GREEN = "#10b981"      # net alt line (2nd chart)
+SLATE = "#334155"
 LIGHT_GRAY = "#e5e7eb"
 
 st.markdown("""
@@ -58,13 +58,13 @@ def _get_target_series(df: pd.DataFrame) -> pd.Series | None:
     return None
 
 def _kfmt(n: float) -> str:
-    """K formatter for volumes/pieces."""
+    """K formatter for bars."""
     if pd.isna(n): return ""
     if n >= 1000: return f"{n/1000:.1f}K"
     return f"{n:.0f}"
 
 def make_semi_gauge(title: str, value: float) -> go.Figure:
-    """Semi-donut gauge with large percentage in the center."""
+    """Semi-donut gauge with centered percentage."""
     v = max(0, min(100, 0 if pd.isna(value) else value))
     fig = go.Figure()
     fig.add_trace(go.Pie(
@@ -77,22 +77,24 @@ def make_semi_gauge(title: str, value: float) -> go.Figure:
         marker=dict(colors=[NAVY, "#d1d5db", "rgba(0,0,0,0)"]),
         showlegend=False
     ))
-    # Big percentage in the center (raised for visibility)
+    # Centered % label
     fig.add_annotation(
         text=f"{v:.2f}%",
-        x=0.5, y=0.60,  # higher than center so it never looks clipped
+        x=0.5, y=0.5,  # truly centered
+        xref="paper", yref="paper",
         showarrow=False,
         font=dict(size=26, color=NAVY, family="Arial Black")
+    )
+    # Title
+    fig.add_annotation(
+        text=title,
+        x=0.5, y=1.18, showarrow=False,
+        xref="paper", yref="paper",
+        font=dict(size=14, color=SLATE, family="Arial")
     )
     fig.update_layout(
         margin=dict(l=10, r=10, t=36, b=0),
         height=180,
-    )
-    # Title just above the gauge
-    fig.add_annotation(
-        text=title,
-        x=0.5, y=1.18, showarrow=False,
-        font=dict(size=14, color=SLATE, family="Arial")
     )
     return fig
 
@@ -110,7 +112,7 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
       - Filters: PU CTRY in {DE, IT, IL} and STATUS=440-BILLED
       - Dates: POD (actual delivery) and ACT PU (pickup), Target = UPD DEL → QDT
       - OTP: Gross = POD<=Target; Net = only controllable lates count
-      - Month keys for both POD and ACT PU
+      - Month keys: POD and ACT PU for grouping
     """
     required = ["PU CTRY", "STATUS", "POD DATE/TIME"]
     if not all(c in df.columns for c in required):
@@ -124,21 +126,19 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     if d.empty:
         return d
 
-    # Actual delivery (POD) & pickup (ACT PU)
-    d["_adate"] = _excel_to_dt(d["POD DATE/TIME"])
-    d["_pudate"] = _excel_to_dt(d["ACT PU"]) if "ACT PU" in d.columns else pd.NaT
-
-    # Target date
+    # Dates
+    d["_adate"]  = _excel_to_dt(d["POD DATE/TIME"])                 # actual delivery (POD)
+    d["_pudate"] = _excel_to_dt(d["ACT PU"]) if "ACT PU" in d.columns else pd.NaT  # actual pickup
     tgt = _get_target_series(d)
     d["_target"] = _excel_to_dt(tgt) if tgt is not None else pd.NaT
 
-    # Month (full text) for both bases
+    # Month labels
     d["Month_POD_Display"] = d["_adate"].dt.strftime("%b %Y")
-    d["Month_POD_Sort"] = pd.to_datetime(d["Month_POD_Display"], format="%b %Y", errors="coerce")
-    d["Month_PU_Display"] = d["_pudate"].dt.strftime("%b %Y")
-    d["Month_PU_Sort"] = pd.to_datetime(d["Month_PU_Display"], format="%b %Y", errors="coerce")
+    d["Month_POD_Sort"]    = pd.to_datetime(d["Month_POD_Display"], format="%b %Y", errors="coerce")
+    d["Month_PU_Display"]  = d["_pudate"].dt.strftime("%b %Y")
+    d["Month_PU_Sort"]     = pd.to_datetime(d["Month_PU_Display"], format="%b %Y", errors="coerce")
 
-    # QC controllable flag from QC NAME
+    # QC controllable flag
     if "QC NAME" in d.columns:
         d["QC_NAME_CLEAN"] = d["QC NAME"].astype(str)
         d["Is_Controllable"] = d["QC_NAME_CLEAN"].str.contains(CTRL_REGEX, na=False)
@@ -146,12 +146,11 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
         d["QC_NAME_CLEAN"] = ""
         d["Is_Controllable"] = False
 
-    # On-time (gross)
+    # OTP
     ok = d["_adate"].notna() & d["_target"].notna()
     d["On_Time_Gross"] = False
     d.loc[ok, "On_Time_Gross"] = d.loc[ok, "_adate"] <= d.loc[ok, "_target"]
 
-    # Net marks NON-controllable lates as on-time
     d["Late"] = ~d["On_Time_Gross"]
     d["On_Time_Net"] = d["On_Time_Gross"] | (d["Late"] & ~d["Is_Controllable"])
 
@@ -182,79 +181,51 @@ def calc_summary(df: pd.DataFrame):
             round(net, 2) if pd.notna(net) else np.nan,
             total_ship, exceptions, controllables, uncontrollables)
 
-def _month_cols(basis: str):
-    """Return (display_col, sort_col) for basis: 'pod' or 'pu'."""
-    if basis == "pu":
-        return "Month_PU_Display", "Month_PU_Sort"
-    return "Month_POD_Display", "Month_POD_Sort"
-
 @st.cache_data(show_spinner=False)
-def monthly_otp_and_metric(df: pd.DataFrame, basis: str, metric_col: str):
-    """
-    Generic monthly aggregator:
-      - basis: 'pod' (default) or 'pu' (use ACT PU)
-      - metric_col: 'Volume' (count rows with non-null basis date) or 'Pieces' (sum PIECES with non-null basis date)
-      - OTP% computed on rows with POD & Target present, grouped by the same basis month
-    """
-    disp_col, sort_col = _month_cols(basis)
-
-    # base for metric (rows that have the basis date)
-    base_date_col = "_adate" if basis == "pod" else "_pudate"
-    base = df.dropna(subset=[base_date_col]).copy()
-
-    if base.empty:
-        cols = ["Month_Display", metric_col, "Gross_OTP", "Net_OTP", "Month_Sort"]
-        return pd.DataFrame(columns=cols)
-
-    if metric_col == "Volume":
-        metric = base.groupby(disp_col, as_index=False).size()
-        metric.columns = ["Month_Display", "Volume"]
-    elif metric_col == "Pieces":
-        metric = base.groupby(disp_col, as_index=False)["PIECES"].sum()
-        metric.columns = ["Month_Display", "Pieces"]
-    else:
-        raise ValueError("metric_col must be 'Volume' or 'Pieces'")
-
-    # OTP on valid rows (POD & Target present), grouped by the same basis month
+def monthly_otp_by_pod(df: pd.DataFrame) -> pd.DataFrame:
+    """Gross & Net OTP grouped by POD month (single source of truth for OTP across charts)."""
     valid = df.dropna(subset=["_adate", "_target"]).copy()
     if valid.empty:
-        out = metric.copy()
-        out["Gross_OTP"] = np.nan
-        out["Net_OTP"] = np.nan
-    else:
-        # add month label of chosen basis to valid set
-        valid["__month"] = valid[disp_col]
-        g = valid.groupby("__month", as_index=False).agg(
-            Gross_On=("On_Time_Gross", "sum"),
-            Gross_Tot=("On_Time_Gross", "count")
-        )
-        n = valid.groupby("__month", as_index=False).agg(
-            Net_On=("On_Time_Net", "sum"),
-            Net_Tot=("On_Time_Net", "count")
-        )
-        out = metric.merge(g, left_on="Month_Display", right_on="__month", how="left").merge(
-            n, left_on="Month_Display", right_on="__month", how="left"
-        )
-        out.drop(columns=["__month_x", "__month_y"], inplace=True, errors="ignore")
-        out["Gross_OTP"] = (out["Gross_On"] / out["Gross_Tot"] * 100).round(2)
-        out["Net_OTP"]   = (out["Net_On"] / out["Net_Tot"] * 100).round(2)
+        return pd.DataFrame(columns=["Month_Display","Gross_OTP","Net_OTP","Month_Sort"])
 
-    out["Month_Sort"] = pd.to_datetime(out["Month_Display"], format="%b %Y", errors="coerce")
-    return out.sort_values("Month_Sort")
+    g = valid.groupby("Month_POD_Display", as_index=False).agg(
+        Gross_On=("On_Time_Gross", "sum"),
+        Gross_Tot=("On_Time_Gross", "count"),
+        Net_On=("On_Time_Net", "sum"),
+        Net_Tot=("On_Time_Net", "count")
+    )
+    g["Gross_OTP"] = (g["Gross_On"] / g["Gross_Tot"] * 100).round(2)
+    g["Net_OTP"]   = (g["Net_On"] / g["Net_Tot"] * 100).round(2)
+    g["Month_Display"] = g["Month_POD_Display"]
+    g["Month_Sort"]    = pd.to_datetime(g["Month_Display"], format="%b %Y", errors="coerce")
+    return g[["Month_Display", "Gross_OTP", "Net_OTP", "Month_Sort"]].sort_values("Month_Sort")
+
+@st.cache_data(show_spinner=False)
+def monthly_volume_by_pod(df: pd.DataFrame) -> pd.DataFrame:
+    """Order volume by POD month (count of rows with POD present)."""
+    base = df.dropna(subset=["_adate"]).copy()
+    if base.empty:
+        return pd.DataFrame(columns=["Month_Display","Volume","Month_Sort"])
+    v = base.groupby("Month_POD_Display", as_index=False).size()
+    v.columns = ["Month_Display", "Volume"]
+    v["Month_Sort"] = pd.to_datetime(v["Month_Display"], format="%b %Y", errors="coerce")
+    return v.sort_values("Month_Sort")
+
+@st.cache_data(show_spinner=False)
+def monthly_pieces_by_pu(df: pd.DataFrame) -> pd.DataFrame:
+    """PIECES summed by ACT PU month (as requested)."""
+    base = df.dropna(subset=["_pudate"]).copy()
+    if base.empty:
+        return pd.DataFrame(columns=["Month_Display","Pieces","Month_Sort"])
+    p = base.groupby("Month_PU_Display", as_index=False)["PIECES"].sum()
+    p.columns = ["Month_Display", "Pieces"]
+    p["Month_Sort"] = pd.to_datetime(p["Month_Display"], format="%b %Y", errors="coerce")
+    return p.sort_values("Month_Sort")
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
     up = st.file_uploader("Upload Excel (.xlsx) or CSV", type=["xlsx", "csv"])
     otp_target = st.number_input("OTP Target (%)", min_value=0, max_value=100, value=OTP_TARGET, step=1)
-
-    st.markdown("**Month basis selectors**")
-    # Default per your specs: OTP by POD; Pieces by ACT PU
-    basis_volume = st.selectbox("Volume + Net OTP month", ["Actual Delivery (POD)", "Actual Pickup (ACT PU)"], index=0)
-    basis_pieces = st.selectbox("Pieces + Net OTP month", ["Actual Delivery (POD)", "Actual Pickup (ACT PU)"], index=1)
-
-    basis_map = {"Actual Delivery (POD)": "pod", "Actual Pickup (ACT PU)": "pu"}
-    basis_volume = basis_map[basis_volume]
-    basis_pieces = basis_map[basis_pieces]
 
 if not up:
     st.info("👆 Upload your Excel/CSV to compute OTP (filters: DE/IT/IL & 440-BILLED).")
@@ -274,9 +245,10 @@ if df.empty:
 
 gross_otp, net_otp, total_ship, exceptions, controllables, uncontrollables = calc_summary(df)
 
-# Monthly frames
-mv = monthly_otp_and_metric(df, basis=basis_volume, metric_col="Volume")  # Volume+OTP by selected basis (default POD)
-mp = monthly_otp_and_metric(df, basis=basis_pieces, metric_col="Pieces")  # Pieces+OTP by selected basis (default ACT PU)
+# Monthly frames (OTP always by POD)
+otp_pod = monthly_otp_by_pod(df)          # Gross/Net OTP by POD
+vol_pod = monthly_volume_by_pod(df)       # Volume by POD
+pieces_pu = monthly_pieces_by_pu(df)      # Pieces by ACT PU
 
 # ---------------- KPI & Gauges ----------------
 left, right = st.columns([1, 1.5])
@@ -296,27 +268,28 @@ with right:
     with g3:
         st.plotly_chart(make_semi_gauge("Raw OTP", gross_otp), use_container_width=True, config={"displayModeBar": False})
 
-with st.expander("How do we place an order into a month?"):
+with st.expander("How months are defined"):
     st.markdown("""
-- **OTP month**: by default, charts use **Actual Delivery (POD)**, matching your requirement “OTP month-on-month based on the actual delivery date”.
-- **Volume month**: configurable (POD or ACT PU). Default = **POD**.
-- **Pieces month**: configurable (POD or ACT PU). Default = **ACT PU**, matching your earlier request.
-You can change both in the sidebar.
+- **OTP (Gross/Net) month:** **Actual Delivery (POD)**. This is the single source of truth, so **gross & net OTP per month are the same across all plots**.
+- **Volume (orders) per month:** **POD**.
+- **PIECES per month:** **ACT PU** (as requested). OTP lines on that chart still come from **POD** and are matched by calendar month.
     """)
 
 st.markdown("---")
 
-# ---------------- Chart 1: Controllable OTP by Volume ----------------
-st.subheader("Controllable OTP by Volume")
+# ---------------- Chart 1: Controllable OTP by Volume (POD) ----------------
+st.subheader("Controllable OTP by Volume (POD)")
 
-if not mv.empty:
+if not vol_pod.empty:
+    # Merge volume with OTP (both by POD month)
+    mv = vol_pod.merge(otp_pod, on="Month_Display", how="left").sort_values("Month_Sort")
     x_labels = mv["Month_Display"].astype(str).tolist()
     vol_vals = mv["Volume"].astype(float).tolist()
     net_vals = mv["Net_OTP"].astype(float).tolist()
 
     fig = go.Figure()
 
-    # Bars = monthly volume (navy) with K-labels on top
+    # Bars = monthly volume (navy) with labels
     fig.add_trace(go.Bar(
         x=x_labels,
         y=vol_vals,
@@ -339,18 +312,19 @@ if not mv.empty:
         yaxis="y2"
     ))
 
-    # % labels — lifted more to be crystal clear ( +7% )
+    # % labels — lifted with pixel offset (so June etc. always visible)
     for xi, yi in zip(x_labels, net_vals):
         if pd.notna(yi):
             fig.add_annotation(
-                x=xi, y=yi + 7,
+                x=xi, y=yi,
                 xref="x", yref="y2",
+                yshift=18,                 # pixel lift
                 text=f"{yi:.2f}%",
                 showarrow=False,
                 font=dict(size=12, color="#111827")
             )
 
-    # Target line on secondary axis (version-safe)
+    # Target line on secondary axis
     try:
         fig.add_hline(y=float(otp_target), line_dash="dash", line_color="red", yref="y2")
     except Exception:
@@ -361,7 +335,7 @@ if not mv.empty:
         )
 
     fig.update_layout(
-        height=500,
+        height=520,
         hovermode="x unified",
         plot_bgcolor="white",
         margin=dict(l=40, r=40, t=40, b=80),
@@ -383,21 +357,23 @@ if not mv.empty:
             title="Controllable OTP (%)",
             overlaying="y",
             side="right",
-            range=[0, 120]  # extra headroom so labels never clip
+            range=[0, 130]  # extra headroom for raised labels
         ),
         barmode="overlay"
     )
 
     st.plotly_chart(fig, use_container_width=True)
 else:
-    st.info("No monthly data available.")
+    st.info("No monthly volume available.")
 
 st.markdown("---")
 
-# ---------------- Chart 1b: Controllable OTP by Pieces ----------------
-st.subheader("Controllable OTP by Pieces")
+# ---------------- Chart 1b: Controllable OTP by PIECES (PIECES by ACT PU, OTP by POD) ----------------
+st.subheader("Controllable OTP by Pieces (Pieces by ACT PU, OTP by POD)")
 
-if not mp.empty:
+if not pieces_pu.empty:
+    # Join pieces (ACT PU month) with OTP (POD month) by month name
+    mp = pieces_pu.merge(otp_pod, on="Month_Display", how="left").sort_values("Month_Sort")
     x_labels = mp["Month_Display"].astype(str).tolist()
     pieces_vals = mp["Pieces"].astype(float).tolist()
     net_vals_p = mp["Net_OTP"].astype(float).tolist()
@@ -408,7 +384,7 @@ if not mp.empty:
     figp.add_trace(go.Bar(
         x=x_labels,
         y=pieces_vals,
-        name="Pieces",
+        name="Pieces (ACT PU)",
         marker_color=NAVY,
         text=[_kfmt(v) for v in pieces_vals],
         textposition="outside",
@@ -416,23 +392,24 @@ if not mp.empty:
         yaxis="y"
     ))
 
-    # Line = Net OTP % (gold)
+    # Line = Net OTP % (gold; from POD)
     figp.add_trace(go.Scatter(
         x=x_labels,
         y=net_vals_p,
-        name="Controllable OTP",
+        name="Controllable OTP (POD)",
         mode="lines+markers",
         line=dict(color=GOLD, width=3),
         marker=dict(size=8),
         yaxis="y2"
     ))
 
-    # % labels — lifted more ( +7% )
+    # % labels — lifted with pixel offset (fixes August visibility)
     for xi, yi in zip(x_labels, net_vals_p):
         if pd.notna(yi):
             figp.add_annotation(
-                x=xi, y=yi + 7,
+                x=xi, y=yi,
                 xref="x", yref="y2",
+                yshift=18,
                 text=f"{yi:.2f}%",
                 showarrow=False,
                 font=dict(size=12, color="#111827")
@@ -449,7 +426,7 @@ if not mp.empty:
         )
 
     figp.update_layout(
-        height=500,
+        height=520,
         hovermode="x unified",
         plot_bgcolor="white",
         margin=dict(l=40, r=40, t=40, b=80),
@@ -463,7 +440,7 @@ if not mp.empty:
             automargin=True
         ),
         yaxis=dict(
-            title="Pieces",
+            title="Pieces (ACT PU)",
             side="left",
             gridcolor=LIGHT_GRAY
         ),
@@ -471,26 +448,24 @@ if not mp.empty:
             title="Controllable OTP (%)",
             overlaying="y",
             side="right",
-            range=[0, 120]
+            range=[0, 130]  # extra headroom for raised labels
         ),
         barmode="overlay"
     )
 
     st.plotly_chart(figp, use_container_width=True)
 else:
-    st.info("No monthly PIECES data available.")
+    st.info("No monthly PIECES available (ACT PU).")
 
 st.markdown("---")
 
-# ---------------- Chart 2: Monthly OTP Trend (Gross vs Net + 95% only) ----------------
+# ---------------- Chart 2: Monthly OTP Trend (Gross vs Net by POD) ----------------
 st.subheader("Monthly OTP Trend (Gross vs Net) — by Actual Delivery (POD)")
 
-# Build a Gross vs Net MoM frame using POD basis (your requirement for OTP)
-m_pod = monthly_otp_and_metric(df, basis="pod", metric_col="Volume")
-if not m_pod.empty:
-    gross_vals = m_pod.get("Gross_OTP", pd.Series([np.nan]*len(m_pod))).astype(float).tolist()
-    net_vals   = m_pod.get("Net_OTP", pd.Series([np.nan]*len(m_pod))).astype(float).tolist()
-    x_labels   = m_pod["Month_Display"].astype(str).tolist()
+if not otp_pod.empty:
+    x_labels = otp_pod["Month_Display"].astype(str).tolist()
+    gross_vals = otp_pod["Gross_OTP"].astype(float).tolist()
+    net_vals   = otp_pod["Net_OTP"].astype(float).tolist()
 
     fig2 = go.Figure()
 
@@ -509,15 +484,21 @@ if not m_pod.empty:
         marker=dict(size=7),
     ))
 
-    # % labels — lifted more ( +7% ) for both series
+    # % labels — raised with pixel offset
     for xi, yi in zip(x_labels, gross_vals):
         if pd.notna(yi):
-            fig2.add_annotation(x=xi, y=yi + 7, text=f"{yi:.2f}%", showarrow=False,
-                                xref="x", yref="y", font=dict(size=12, color=BLUE))
+            fig2.add_annotation(
+                x=xi, y=yi, xref="x", yref="y",
+                yshift=18, text=f"{yi:.2f}%", showarrow=False,
+                font=dict(size=12, color=BLUE)
+            )
     for xi, yi in zip(x_labels, net_vals):
         if pd.notna(yi):
-            fig2.add_annotation(x=xi, y=yi + 7, text=f"{yi:.2f}%", showarrow=False,
-                                xref="x", yref="y", font=dict(size=12, color=GREEN))
+            fig2.add_annotation(
+                x=xi, y=yi, xref="x", yref="y",
+                yshift=18, text=f"{yi:.2f}%", showarrow=False,
+                font=dict(size=12, color=GREEN)
+            )
 
     # Target
     try:
@@ -530,7 +511,7 @@ if not m_pod.empty:
         )
 
     fig2.update_layout(
-        height=440,
+        height=460,
         hovermode="x unified",
         plot_bgcolor="white",
         margin=dict(l=40, r=40, t=40, b=80),
@@ -545,7 +526,7 @@ if not m_pod.empty:
         ),
         yaxis=dict(
             title="OTP (%)",
-            range=[0, 120],
+            range=[0, 130],
             gridcolor=LIGHT_GRAY
         )
     )
@@ -553,4 +534,7 @@ if not m_pod.empty:
 else:
     st.info("No monthly OTP trend available.")
 
-st.caption("Gross: POD ≤ target (UPD DEL → QDT). Net: only controllable lates (Agent / Del Agt / Delivery agent / Customs / Warehouse / W/house) count against OTP. Filters: PU CTRY ∈ {DE, IT, IL}, STATUS = 440-BILLED.")
+st.caption(
+    "Gross: POD ≤ target (UPD DEL → QDT). Net: only controllable lates (Agent / Del Agt / Delivery agent / Customs / Warehouse / W/house) count against OTP. "
+    "Filters: PU CTRY ∈ {DE, IT, IL}, STATUS = 440-BILLED. OTP per month = POD; PIECES per month = ACT PU."
+)
