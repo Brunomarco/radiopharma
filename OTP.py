@@ -4,7 +4,7 @@ import pandas as pd
 import streamlit as st
 import plotly.graph_objects as go
 
-# ---------------- Page & Style ----------------
+# ---------------- Page & style ----------------
 st.set_page_config(page_title="Radiopharma OTP", page_icon="📊",
                    layout="wide", initial_sidebar_state="collapsed")
 
@@ -43,21 +43,13 @@ def _excel_to_dt(s: pd.Series) -> pd.Series:
         out  = out.where(~out.isna(), out2)
     return out
 
-def _get_target_series(df: pd.DataFrame) -> pd.Series | None:
-    if "UPD DEL" in df.columns and df["UPD DEL"].notna().any():
-        return df["UPD DEL"]
-    if "QDT" in df.columns:
-        return df["QDT"]
-    return None
-
 def _kfmt(n: float) -> str:
     if pd.isna(n): return ""
     try: n = float(n)
     except: return ""
     return f"{n/1000:.1f}K" if n >= 1000 else f"{n:.0f}"
 
-def make_semi_gauge(title: str, value: float) -> go.Figure:
-    """Semi-donut gauge with centered %."""
+def _make_gauge(title: str, value: float) -> go.Figure:
     v = max(0.0, min(100.0, 0.0 if pd.isna(value) else float(value)))
     fig = go.Figure()
     fig.add_trace(go.Pie(
@@ -73,6 +65,7 @@ def make_semi_gauge(title: str, value: float) -> go.Figure:
     fig.update_layout(margin=dict(l=10, r=10, t=36, b=0), height=180)
     return fig
 
+# ---------------- IO ----------------
 @st.cache_data(show_spinner=False)
 def read_file(uploaded) -> pd.DataFrame:
     name = uploaded.name.lower()
@@ -80,25 +73,18 @@ def read_file(uploaded) -> pd.DataFrame:
         return pd.read_csv(uploaded)
     return pd.read_excel(uploaded)  # openpyxl
 
+# ---------------- Prep & Dedup ----------------
 @st.cache_data(show_spinner=False)
 def preprocess(df: pd.DataFrame) -> pd.DataFrame:
     """
-    Each row = one entry.
-    Filters:
-      - PU CTRY ∈ {DE, IT, IL}
-      - STATUS = 440-BILLED
-    Month basis: POD (Actual Delivery) → YYYY-MM.
-    OTP:
-      - Gross = POD ≤ target (UPD DEL → QDT)
-      - Net = Gross OR (Late & NOT controllable) → Net ≥ Gross
+    Filter to PU CTRY in {DE, IT, IL} and STATUS=440-BILLED.
+    Parse POD/UPD DEL/QDT, PIECES numeric, QC NAME controllable flag.
     """
-    required = ["PU CTRY", "STATUS", "POD DATE/TIME"]
+    required = ["PU CTRY", "STATUS", "POD DATE/TIME", "REFER"]
     if not all(c in df.columns for c in required):
         return pd.DataFrame()
 
     d = df.copy()
-
-    # Scope
     d["_pu"]     = d["PU CTRY"].astype(str).str.strip()
     d["_status"] = d["STATUS"].astype(str).str.strip().str.lower()
     d = d[d["_pu"].isin(SCOPE_PU)]
@@ -107,81 +93,100 @@ def preprocess(df: pd.DataFrame) -> pd.DataFrame:
         return d
 
     # Dates
-    d["_pod"]    = _excel_to_dt(d["POD DATE/TIME"])             # POD = single month-of-record
-    target_raw   = _get_target_series(d)
-    d["_target"] = _excel_to_dt(target_raw) if target_raw is not None else pd.NaT
+    d["_pod"]   = _excel_to_dt(d["POD DATE/TIME"])
+    d["_upd"]   = _excel_to_dt(d["UPD DEL"]) if "UPD DEL" in d.columns else pd.NaT
+    d["_qdt"]   = _excel_to_dt(d["QDT"])     if "QDT"     in d.columns else pd.NaT
+    d["_target"]= d["_upd"].where(d["_upd"].notna(), d["_qdt"])
 
-    # Month keys from POD
-    d["Month_YYYY_MM"] = d["_pod"].dt.to_period("M").astype(str)        # '2025-07'
-    d["Month_Sort"]    = pd.to_datetime(d["Month_YYYY_MM"] + "-01")
-    d["Month_Display"] = d["Month_Sort"].dt.strftime("%b %Y")           # 'Jul 2025'
+    # PIECES
+    d["PIECES"] = pd.to_numeric(d.get("PIECES", 0), errors="coerce").fillna(0)
 
-    # Controllable flag (QC NAME)
+    # QC NAME controllable?
     if "QC NAME" in d.columns:
         d["QC_NAME_CLEAN"] = d["QC NAME"].astype(str)
-        d["Is_Controllable"] = d["QC_NAME_CLEAN"].str.contains(CTRL_REGEX, na=False)
+        d["Is_Controllable_Row"] = d["QC_NAME_CLEAN"].str.contains(CTRL_REGEX, na=False)
     else:
         d["QC_NAME_CLEAN"] = ""
-        d["Is_Controllable"] = False
-
-    # PIECES numeric
-    if "PIECES" in d.columns:
-        d["PIECES"] = pd.to_numeric(d["PIECES"], errors="coerce").fillna(0)
-    else:
-        d["PIECES"] = 0
-
-    # Row-level OTP
-    ok = d["_pod"].notna() & d["_target"].notna()
-    d["On_Time_Gross"] = False
-    d.loc[ok, "On_Time_Gross"] = d.loc[ok, "_pod"] <= d.loc[ok, "_target"]
-    d["Late"] = ~d["On_Time_Gross"]
-    d["On_Time_Net"] = d["On_Time_Gross"] | (d["Late"] & ~d["Is_Controllable"])  # adjust non-controllable lates
+        d["Is_Controllable_Row"] = False
 
     return d
 
 @st.cache_data(show_spinner=False)
-def monthly_frames(d: pd.DataFrame):
-    """Build Monthly OTP, Volume, Pieces — all by POD month with the same keys."""
-    # Use rows that have POD for volume/pieces
-    base_vol = d.dropna(subset=["_pod"]).copy()
-    vol = (base_vol.groupby(["Month_YYYY_MM","Month_Display","Month_Sort"], as_index=False)
-                 .size().rename(columns={"size":"Volume"}))
+def dedup_by_refer(d: pd.DataFrame) -> pd.DataFrame:
+    """
+    One entry per REFER (avoid double counting the same client/shipment).
+      - POD = latest POD
+      - Target = latest UPD DEL else latest QDT
+      - PIECES = max non-null pieces
+      - Controllable = any controllable QC in that REFER
+    """
+    if d.empty:
+        return d
 
-    pieces = (base_vol.groupby(["Month_YYYY_MM","Month_Display","Month_Sort"], as_index=False)
-                      .agg(Pieces=("PIECES","sum")))
+    g = (d.groupby("REFER", as_index=False).agg(
+        _pod        = ("_pod", "max"),
+        _upd        = ("_upd", "max"),
+        _qdt        = ("_qdt", "max"),
+        PIECES      = ("PIECES", "max"),
+        PU_CTRY     = ("PU CTRY", "first"),
+        Is_Controll = ("Is_Controllable_Row", "any"),
+    ))
+    g["_target"] = g["_upd"].where(g["_upd"].notna(), g["_qdt"])
 
-    # OTP needs both POD & target
-    base_otp = d.dropna(subset=["_pod","_target"]).copy()
-    if base_otp.empty:
+    # Month keys from POD (Actual Delivery)
+    g["Month_YYYY_MM"] = g["_pod"].dt.to_period("M").astype(str)
+    g["Month_Sort"]    = pd.to_datetime(g["Month_YYYY_MM"] + "-01", errors="coerce")
+    g["Month_Display"] = g["Month_Sort"].dt.strftime("%b %Y")
+
+    # Row-level OTP on deduped entries
+    ok = g["_pod"].notna() & g["_target"].notna()
+    g["On_Time_Gross"] = False
+    g.loc[ok, "On_Time_Gross"] = g.loc[ok, "_pod"] <= g.loc[ok, "_target"]
+    g["Late"]         = ~g["On_Time_Gross"]
+    g["On_Time_Net"]  = g["On_Time_Gross"] | (g["Late"] & ~g["Is_Controll"])
+
+    return g
+
+# ---------------- Monthly builders ----------------
+@st.cache_data(show_spinner=False)
+def monthly_frames(ship: pd.DataFrame):
+    """Monthly Volume (unique entries), Pieces, OTP — by POD month."""
+    base = ship.dropna(subset=["_pod"]).copy()
+
+    vol = (base.groupby(["Month_YYYY_MM","Month_Display","Month_Sort"], as_index=False)
+                .size().rename(columns={"size":"Volume"}))
+
+    pieces = (base.groupby(["Month_YYYY_MM","Month_Display","Month_Sort"], as_index=False)
+                   .agg(Pieces=("PIECES","sum")))
+
+    otp_base = ship.dropna(subset=["_pod","_target"]).copy()
+    if otp_base.empty:
         otp = pd.DataFrame(columns=["Month_YYYY_MM","Month_Display","Month_Sort","Gross_OTP","Net_OTP"])
     else:
-        otp = (base_otp.groupby(["Month_YYYY_MM","Month_Display","Month_Sort"], as_index=False)
+        otp = (otp_base.groupby(["Month_YYYY_MM","Month_Display","Month_Sort"], as_index=False)
                       .agg(Gross_On=("On_Time_Gross","sum"),
                            Gross_Tot=("On_Time_Gross","count"),
                            Net_On=("On_Time_Net","sum"),
                            Net_Tot=("On_Time_Net","count")))
-        otp["Gross_OTP"] = (otp["Gross_On"] / otp["Gross_Tot"] * 100).round(2)
-        otp["Net_OTP"]   = (otp["Net_On"]   / otp["Net_Tot"]   * 100).round(2)
+        otp["Gross_OTP"] = (otp["Gross_On"]/otp["Gross_Tot"]*100).round(2)
+        otp["Net_OTP"]   = (otp["Net_On"]/otp["Net_Tot"]*100).round(2)
 
-    vol    = vol.sort_values("Month_Sort")
-    pieces = pieces.sort_values("Month_Sort")
-    otp    = otp.sort_values("Month_Sort")
+    vol, pieces, otp = [x.sort_values("Month_Sort") for x in (vol, pieces, otp)]
     return vol, pieces, otp
 
-def calc_summary(d: pd.DataFrame):
-    base_otp = d.dropna(subset=["_pod","_target"])
-    total_rows = int(len(base_otp))  # rows valid for OTP calc
-    gross = (base_otp["On_Time_Gross"].mean() * 100) if total_rows else np.nan
-    net   = (base_otp["On_Time_Net"].mean()   * 100) if total_rows else np.nan
-    if pd.notna(gross) and pd.notna(net) and net < gross:
+def calc_summary(ship: pd.DataFrame):
+    otp_base = ship.dropna(subset=["_pod","_target"])
+    gross = otp_base["On_Time_Gross"].mean()*100 if len(otp_base) else np.nan
+    net   = otp_base["On_Time_Net"].mean()*100   if len(otp_base) else np.nan
+    if pd.notna(gross) and pd.notna(net) and net < gross:  # safety: Net ≥ Gross per spec
         net = gross
-    late_df         = base_otp[base_otp["Late"]]
+    late_df         = otp_base[otp_base["Late"]]
     exceptions      = int(len(late_df))
-    controllables   = int(late_df["Is_Controllable"].sum())
-    uncontrollables = int(exceptions - controllables)
+    controllables   = int(late_df["Is_Controll"].sum())
+    uncontrollables = exceptions - controllables
     return round(gross,2) if pd.notna(gross) else np.nan, \
            round(net,2)   if pd.notna(net)   else np.nan, \
-           int(len(d.dropna(subset=["_pod"]))), exceptions, controllables, uncontrollables
+           int(len(ship.dropna(subset=["_pod"]))), exceptions, controllables, uncontrollables
 
 # ---------------- Sidebar ----------------
 with st.sidebar:
@@ -189,7 +194,7 @@ with st.sidebar:
     otp_target = st.number_input("OTP Target (%)", min_value=0, max_value=100, value=OTP_TARGET, step=1)
 
 if not up:
-    st.info("👆 Upload your Excel/CSV. Filters applied: PU CTRY ∈ {DE, IT, IL} & STATUS = 440-BILLED.")
+    st.info("👆 Upload your file. We apply: PU CTRY ∈ {DE, IT, IL}, STATUS = 440-BILLED, one entry per REFER.")
     st.stop()
 
 # ---------------- Pipeline ----------------
@@ -201,42 +206,42 @@ except Exception as e:
 
 df = preprocess(raw)
 if df.empty:
-    st.error("No rows after filtering or required columns missing. Need: PU CTRY, STATUS, POD DATE/TIME (+ UPD DEL or QDT).")
+    st.error("No rows after filtering or required columns missing. Needed: PU CTRY, STATUS, POD DATE/TIME, REFER (+ UPD DEL or QDT).")
     st.stop()
 
-vol_pod, pieces_pod, otp_pod = monthly_frames(df)
-gross_otp, net_otp, volume_total, exceptions, controllables, uncontrollables = calc_summary(df)
+# *** Key fix: one entry per REFER (no double counting) ***
+ship = dedup_by_refer(df)
+
+vol_pod, pieces_pod, otp_pod = monthly_frames(ship)
+gross_otp, net_otp, volume_total, exceptions, controllables, uncontrollables = calc_summary(ship)
 
 # ---------------- KPIs & Gauges ----------------
 left, right = st.columns([1, 1.5])
 with left:
-    st.markdown(f'<div class="kpi"><div class="k-num">{volume_total:,}</div><div class="k-cap">Volume (rows with POD)</div></div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi"><div class="k-num">{volume_total:,}</div><div class="k-cap">Volume (unique entries)</div></div>', unsafe_allow_html=True)
     st.markdown(f'<div class="kpi"><div class="k-num">{exceptions:,}</div><div class="k-cap">Exceptions (Gross Late)</div></div>', unsafe_allow_html=True)
     st.markdown(f'<div class="kpi"><div class="k-num">{controllables:,}</div><div class="k-cap">Controllables (QC)</div></div>', unsafe_allow_html=True)
     st.markdown(f'<div class="kpi"><div class="k-num">{uncontrollables:,}</div><div class="k-cap">Uncontrollables (QC)</div></div>', unsafe_allow_html=True)
 
 with right:
     c1, c2, c3 = st.columns(3)
-    with c1: st.plotly_chart(make_semi_gauge("Adjusted OTP", max(gross_otp, net_otp)),
-                             use_container_width=True, config={"displayModeBar": False})
-    with c2: st.plotly_chart(make_semi_gauge("Controllable OTP", net_otp),
-                             use_container_width=True, config={"displayModeBar": False})
-    with c3: st.plotly_chart(make_semi_gauge("Raw OTP", gross_otp),
-                             use_container_width=True, config={"displayModeBar": False})
+    with c1: st.plotly_chart(_make_gauge("Adjusted OTP", max(gross_otp, net_otp)), use_container_width=True, config={"displayModeBar": False})
+    with c2: st.plotly_chart(_make_gauge("Controllable OTP", net_otp), use_container_width=True, config={"displayModeBar": False})
+    with c3: st.plotly_chart(_make_gauge("Raw OTP", gross_otp),      use_container_width=True, config={"displayModeBar": False})
 
 with st.expander("Month & logic"):
     st.markdown("""
-- **Each row = one entry** (no deduplication).
-- Month basis: **POD DATE/TIME → YYYY-MM** (e.g., `2025-03-17 00:55` → `2025-03`).
-- **Volume** = number of rows with a POD in the month.
-- **Pieces** = sum(`PIECES`) over those rows in the month.
-- **Gross OTP** = `POD ≤ target (UPD DEL → QDT)`.
-- **Net/Adjusted OTP** = counts **non-controllable** lates as on-time (QC NAME contains Agent / Delivery agent / Customs / Warehouse / W/house).
+- **One entry per REFER** (no double counting). If the export repeats a REFER, we keep:
+  - **Latest POD** and **latest target** (UPD DEL else QDT),
+  - **PIECES = max** non-null across that REFER,
+  - **Controllable** if **any** row for that REFER is controllable.
+- Month basis for Volume/PIECES/OTP: **POD DATE/TIME → YYYY-MM**.
+- Net OTP does **not** penalize controllable lates (Agent / Delivery agent / Customs / Warehouse / W/house) ⇒ **Net ≥ Gross**.
 """)
 
 st.markdown("---")
 
-# ---------------- Chart: Net OTP by Volume (POD) ----------------
+# ---------------- Chart: Net OTP by Volume ----------------
 st.subheader("Controllable (Net) OTP by Volume — POD Month")
 if not vol_pod.empty:
     mv = vol_pod.merge(otp_pod[["Month_YYYY_MM","Net_OTP"]], on="Month_YYYY_MM", how="left").sort_values("Month_Sort")
@@ -245,7 +250,7 @@ if not vol_pod.empty:
     y_net = mv["Net_OTP"].astype(float).tolist()
 
     fig = go.Figure()
-    fig.add_trace(go.Bar(x=x, y=y_vol, name="Volume (Rows)", marker_color=NAVY,
+    fig.add_trace(go.Bar(x=x, y=y_vol, name="Volume (Unique Entries)", marker_color=NAVY,
                          text=[_kfmt(v) for v in y_vol], textposition="outside",
                          textfont=dict(size=12, color="#4b5563"), yaxis="y"))
     fig.add_trace(go.Scatter(x=x, y=y_net, name="Net OTP",
@@ -254,8 +259,7 @@ if not vol_pod.empty:
     for xi, yi in zip(x, y_net):
         if pd.notna(yi):
             fig.add_annotation(x=xi, y=yi, xref="x", yref="y2", yshift=28,
-                               text=f"{yi:.2f}%", showarrow=False,
-                               font=dict(size=12, color="#111827"))
+                               text=f"{yi:.2f}%", showarrow=False, font=dict(size=12, color="#111827"))
     try:
         fig.add_hline(y=float(otp_target), line_dash="dash", line_color="red", yref="y2")
     except Exception:
@@ -265,7 +269,7 @@ if not vol_pod.empty:
                       margin=dict(l=40, r=40, t=40, b=80),
                       legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0),
                       xaxis=dict(title="", tickangle=-30, tickmode="array", tickvals=x, ticktext=x, automargin=True),
-                      yaxis=dict(title="Volume (Rows)", side="left", gridcolor=GRID),
+                      yaxis=dict(title="Volume (Unique Entries)", side="left", gridcolor=GRID),
                       yaxis2=dict(title="Net OTP (%)", overlaying="y", side="right", range=[0, 130]),
                       barmode="overlay")
     st.plotly_chart(fig, use_container_width=True)
@@ -274,7 +278,7 @@ else:
 
 st.markdown("---")
 
-# ---------------- Chart: Net OTP by Pieces (POD) ----------------
+# ---------------- Chart: Net OTP by Pieces ----------------
 st.subheader("Controllable (Net) OTP by Pieces — POD Month")
 if not pieces_pod.empty:
     mp = pieces_pod.merge(otp_pod[["Month_YYYY_MM","Net_OTP"]], on="Month_YYYY_MM", how="left").sort_values("Month_Sort")
@@ -283,7 +287,7 @@ if not pieces_pod.empty:
     y_net = mp["Net_OTP"].astype(float).tolist()
 
     figp = go.Figure()
-    figp.add_trace(go.Bar(x=x, y=y_pcs, name="Pieces", marker_color=NAVY,
+    figp.add_trace(go.Bar(x=x, y=y_pcs, name="Pieces (Sum)", marker_color=NAVY,
                           text=[_kfmt(v) for v in y_pcs], textposition="outside",
                           textfont=dict(size=12, color="#4b5563"), yaxis="y"))
     figp.add_trace(go.Scatter(x=x, y=y_net, name="Net OTP",
@@ -292,8 +296,7 @@ if not pieces_pod.empty:
     for xi, yi in zip(x, y_net):
         if pd.notna(yi):
             figp.add_annotation(x=xi, y=yi, xref="x", yref="y2", yshift=28,
-                                text=f"{yi:.2f}%", showarrow=False,
-                                font=dict(size=12, color="#111827"))
+                                text=f"{yi:.2f}%", showarrow=False, font=dict(size=12, color="#111827"))
     try:
         figp.add_hline(y=float(otp_target), line_dash="dash", line_color="red", yref="y2")
     except Exception:
@@ -303,7 +306,7 @@ if not pieces_pod.empty:
                        margin=dict(l=40, r=40, t=40, b=80),
                        legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0.0),
                        xaxis=dict(title="", tickangle=-30, tickmode="array", tickvals=x, ticktext=x, automargin=True),
-                       yaxis=dict(title="Pieces", side="left", gridcolor=GRID),
+                       yaxis=dict(title="Pieces (Sum)", side="left", gridcolor=GRID),
                        yaxis2=dict(title="Net OTP (%)", overlaying="y", side="right", range=[0, 130]),
                        barmode="overlay")
     st.plotly_chart(figp, use_container_width=True)
@@ -312,7 +315,7 @@ else:
 
 st.markdown("---")
 
-# ---------------- Chart: Gross vs Net OTP (POD) ----------------
+# ---------------- Chart: Gross vs Net OTP ----------------
 st.subheader("Monthly OTP Trend (Gross vs Net) — POD Month")
 if not otp_pod.empty:
     otp_sorted = otp_pod.sort_values("Month_Sort")
@@ -347,15 +350,3 @@ if not otp_pod.empty:
     st.plotly_chart(fig2, use_container_width=True)
 else:
     st.info("No monthly OTP trend available.")
-
-# ---------------- QC breakdown (optional) ----------------
-if "QC_NAME_CLEAN" in df.columns or "QC NAME" in df.columns:
-    qc_src = df.copy()
-    if "QC_NAME_CLEAN" not in qc_src.columns and "QC NAME" in qc_src.columns:
-        qc_src["QC_NAME_CLEAN"] = qc_src["QC NAME"].astype(str)
-    qc_src["Control_Type"] = qc_src["QC_NAME_CLEAN"].str.contains(CTRL_REGEX, na=False).map({True:"Controllable", False:"Non-Controllable"})
-    qc_tbl = (qc_src.groupby(["Control_Type","QC_NAME_CLEAN"], dropna=False)
-                    .size().reset_index(name="Count")
-                    .sort_values(["Control_Type","Count"], ascending=[True, False]))
-    with st.expander("QC NAME breakdown (controllable vs non-controllable)"):
-        st.dataframe(qc_tbl, use_container_width=True)
