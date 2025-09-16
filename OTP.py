@@ -1,97 +1,92 @@
+# OTP-only, fast, minimal dependencies
 import re
 import numpy as np
 import pandas as pd
 import streamlit as st
-import plotly.graph_objects as go
 
-st.set_page_config(page_title="Executive OTP Dashboard — Excel-based", layout="wide")
+st.set_page_config(page_title="Executive OTP (Fast)", layout="wide")
 
-OTP_TARGET_DEFAULT = 95.0
-SCOPE_PU = ["DE", "IT", "IL"]
-CTRL_KEYWORDS_DEFAULT = ["agent", "agt", "customs", "warehouse", "w/house", "delivery agent"]
+OTP_TARGET = 95.0
+SCOPE_PU = {"DE", "IT", "IL"}
+CTRL_KEYWORDS = ["agent", "agt", "customs", "warehouse", "w/house", "delivery agent"]
 
-st.markdown("""
-<style>
-.kpi-card {padding: 1rem; border: 1px solid #e6e6e6; border-radius: 14px;}
-.kpi-title {font-size: 0.9rem; color: #5a5a5a;}
-.kpi-value {font-size: 1.6rem; font-weight: 700;}
-.ok {color:#0b8a42;} .warn {color:#b26a00;} .bad {color:#b00020;}
-</style>
-""", unsafe_allow_html=True)
+st.title("Executive OTP — Fast, Minimal")
+st.caption("Scope: PU CTRY ∈ {DE, IT, IL} AND STATUS = 440-BILLED. OTP based on Actual Delivery ≤ Target.")
 
-st.title("Executive OTP Dashboard — OTP Only (Excel-based)")
-st.caption("Scope: PU CTRY {DE, IT, IL} AND STATUS = 440-BILLED. Gross vs Net (Controllables) by month (Actual Delivery).")
-
+# ---------- Helpers ----------
 def excel_to_datetime(s: pd.Series) -> pd.Series:
     out = pd.to_datetime(s, errors="coerce")
     if out.isna().mean() > 0.5:
-        try:
-            numeric = pd.to_numeric(s, errors="coerce")
-            out2 = pd.to_datetime("1899-12-30") + pd.to_timedelta(numeric, unit="D")
-            out = out.where(~out.isna(), out2)
-        except Exception:
-            pass
+        # Fallback for Excel serials
+        numeric = pd.to_numeric(s, errors="coerce")
+        out2 = pd.to_datetime("1899-12-30") + pd.to_timedelta(numeric, unit="D")
+        out = out.where(~out.isna(), out2)
     return out
 
 @st.cache_data(show_spinner=False)
 def read_uploaded(file) -> pd.DataFrame:
     name = file.name.lower()
     if name.endswith(".csv"):
-        return pd.read_csv(file)
-    return pd.read_excel(file)
+        # Read only the columns we need, case-insensitive map after read
+        df = pd.read_csv(file)
+    else:
+        # Openpyxl required for xlsx (keep in requirements if you need xlsx)
+        try:
+            df = pd.read_excel(
+                file,
+                # If you know exact headers, uncomment and adjust:
+                # usecols=["PU CTRY","STATUS","POD DATE/TIME","UPD DEL","QDT","QC NAME"]
+            )
+        except Exception:
+            df = pd.read_excel(file)  # fallback
+    return df
 
-def guess_column(cols, candidates):
-    lowered = {c.lower(): c for c in cols}
-    for cand in candidates:
-        if cand.lower() in lowered:
-            return lowered[cand.lower()]
+def guess(cols, candidates):
+    low = {c.lower(): c for c in cols}
+    for c in candidates:
+        if c.lower() in low:
+            return low[c.lower()]
     return None
 
 @st.cache_data(show_spinner=False)
-def preprocess_for_otp(df: pd.DataFrame,
-                       pu_ctry_col: str,
-                       status_col: str,
-                       adate_col: str,
-                       target_col: str,
-                       qc_col: str,
-                       ctrl_keywords: list):
+def preprocess(df: pd.DataFrame,
+               pu_col: str, status_col: str,
+               adate_col: str, target_col: str | None,
+               qc_col: str | None,
+               ctrl_kw: list[str]) -> pd.DataFrame:
     d = df.copy()
 
-    # Scope: PU CTRY in DE/IT/IL
-    d["_pu"] = d[pu_ctry_col].astype(str).str.strip()
-    d = d[d["_pu"].isin(SCOPE_PU)]
-
-    # STATUS = 440-BILLED (case-insensitive / whitespace safe)
+    # Normalize early for speed
+    d["_pu"] = d[pu_col].astype(str).str.strip()
     d["_status"] = d[status_col].astype(str).str.strip().str.lower()
-    d = d[d["_status"] == "440-billed"]
 
+    # Scope filter first
+    d = d[d["_pu"].isin(SCOPE_PU)]
+    d = d[d["_status"] == "440-billed"]
     if d.empty:
         return d
 
     # Dates
     d["_adate"] = excel_to_datetime(d[adate_col])
     d["_target"] = excel_to_datetime(d[target_col]) if target_col else pd.NaT
-
-    # Month key
     d["_month"] = d["_adate"].dt.to_period("M").dt.to_timestamp()
 
     # Controllables
     if qc_col:
-        qc_series = d[qc_col].astype(str).str.lower()
-        pattern = "|".join(re.escape(k) for k in ctrl_keywords) if ctrl_keywords else r"$."
-        d["_is_ctrl"] = qc_series.str.contains(pattern, regex=True, na=False)
+        pattern = "|".join(re.escape(k) for k in ctrl_kw) if ctrl_kw else r"$."
+        d["_is_ctrl"] = d[qc_col].astype(str).str.lower().str.contains(pattern, regex=True, na=False)
     else:
         d["_is_ctrl"] = False
 
-    # On-time flag
+    # OTP flag
     d["_on_time"] = False
-    has_dates = d["_adate"].notna() & d["_target"].notna()
-    d.loc[has_dates, "_on_time"] = d.loc[has_dates, "_adate"] <= d.loc[has_dates, "_target"]
+    mask = d["_adate"].notna() & d["_target"].notna()
+    d.loc[mask, "_on_time"] = d.loc[mask, "_adate"] <= d.loc[mask, "_target"]
 
     return d
 
 @st.cache_data(show_spinner=False)
-def compute_monthly_otp(d: pd.DataFrame):
+def compute_otp_monthly(d: pd.DataFrame):
     d = d.dropna(subset=["_month"])
     gross = d.groupby("_month", as_index=False).agg(
         On_Time=("_on_time", "sum"),
@@ -110,79 +105,83 @@ def compute_monthly_otp(d: pd.DataFrame):
         net["Net_OTP_%"] = (net["On_Time"] / net["Total"] * 100).round(1)
     return gross, net
 
-def cls_for_target(pct, target):
+def status_cls(pct, target=OTP_TARGET):
     if pd.isna(pct): return "bad"
     if pct >= target: return "ok"
     if pct >= target - 5: return "warn"
     return "bad"
 
-# Sidebar: Upload & Mapping
+st.markdown("""
+<style>
+.kpi-card {padding:1rem;border:1px solid #e6e6e6;border-radius:14px}
+.kpi-title {font-size:.9rem;color:#5a5a5a}
+.kpi-value {font-size:1.6rem;font-weight:700}
+.ok{color:#0b8a42}.warn{color:#b26a00}.bad{color:#b00020}
+</style>
+""", unsafe_allow_html=True)
+
+# ---------- UI ----------
 with st.sidebar:
     st.header("Upload")
-    up = st.file_uploader("Upload Excel (.xlsx) or CSV", type=["xlsx", "csv"])
+    up = st.file_uploader("Upload .xlsx or .csv", type=["xlsx", "csv"])
+    st.caption("Faster if you upload CSV.")
 
-    st.header("Column Mapping (auto-guessed; adjust if needed)")
 if not up:
-    st.info("Please upload your Excel/CSV file.")
+    st.info("Upload a file to begin.")
     st.stop()
 
-try:
-    raw = read_uploaded(up)
-except Exception as e:
-    st.error(f"Could not read file: {e}")
+# Read
+df = read_uploaded(up)
+if df.empty:
+    st.error("Uploaded file is empty.")
     st.stop()
 
-if raw.empty:
-    st.error("Uploaded file has no rows.")
-    st.stop()
+cols = list(df.columns)
 
-cols = list(raw.columns)
-pu_guess     = guess_column(cols, ["PU CTRY", "PU Country", "Pickup Country", "PU Country Code"])
-status_guess = guess_column(cols, ["STATUS", "Status"])
-adate_guess  = guess_column(cols, ["POD DATE/TIME", "Actual Delivery Date", "Delivery Actual", "POD Date"])
-target_guess = guess_column(cols, ["UPD DEL", "QDT", "Promised Date", "Target Delivery"])
-qc_guess     = guess_column(cols, ["QC NAME", "QC name", "QC", "QC Category", "Exception Category"])
+# Mapping (auto-guessed)
+pu_col     = guess(cols, ["PU CTRY", "PU Country", "Pickup Country", "PU Country Code"]) or st.selectbox("PU CTRY", cols)
+status_col = guess(cols, ["STATUS", "Status"]) or st.selectbox("STATUS", cols)
+adate_col  = guess(cols, ["POD DATE/TIME", "Actual Delivery Date", "Delivery Actual", "POD Date"]) or st.selectbox("Actual Delivery", cols)
+target_col_guess = guess(cols, ["UPD DEL", "QDT", "Promised Date", "Target Delivery"])
+qc_col_guess     = guess(cols, ["QC NAME", "QC name", "QC", "QC Category", "Exception Category"])
 
 with st.sidebar:
-    pu_col     = st.selectbox("Pickup Country (PU CTRY)", [pu_guess] + [c for c in cols if c != pu_guess] if pu_guess else cols)
-    status_col = st.selectbox("STATUS", [status_guess] + [c for c in cols if c != status_guess] if status_guess else cols)
-    adate_col  = st.selectbox("Actual Delivery (POD / ADATE)", [adate_guess] + [c for c in cols if c != adate_guess] if adate_guess else cols)
-    target_col = st.selectbox("Target/Promised Delivery", ["— none —"] + cols, index=(0 if not target_guess else (["— none —"] + cols).index(target_guess)))
-    qc_col     = st.selectbox("QC Name (for controllables)", ["— none —"] + cols, index=(0 if not qc_guess else (["— none —"] + cols).index(qc_guess)))
+    st.header("Column Mapping")
+    pu_col = st.selectbox("Pickup Country (PU)", options=cols, index=cols.index(pu_col) if pu_col in cols else 0)
+    status_col = st.selectbox("STATUS", options=cols, index=cols.index(status_col) if status_col in cols else 0)
+    adate_col = st.selectbox("Actual Delivery (POD)", options=cols, index=cols.index(adate_col) if adate_col in cols else 0)
+    target_col = st.selectbox("Target/Promised Delivery", options=["— none —"] + cols,
+                              index=0 if not target_col_guess else (["— none —"] + cols).index(target_col_guess))
+    qc_col = st.selectbox("QC Name (for controllables)", options=["— none —"] + cols,
+                          index=0 if not qc_col_guess else (["— none —"] + cols).index(qc_col_guess))
+    ctrl_txt = st.text_input("Controllable keywords", value="agent,agt,customs,warehouse,w/house,delivery agent")
+    otp_target = st.number_input("OTP Target %", 0, 100, int(OTP_TARGET), 1)
 
-    st.markdown("---")
-    otp_target = st.number_input("OTP Target %", min_value=0, max_value=100, value=int(OTP_TARGET_DEFAULT), step=1)
-    ctrl_txt   = st.text_input("Controllable QC keywords", value=",".join(CTRL_KEYWORDS_DEFAULT))
+target_col = None if target_col == "— none —" else target_col
+qc_col = None if qc_col == "— none —" else qc_col
+ctrl_kw = [w.strip().lower() for w in ctrl_txt.split(",") if w.strip()]
 
-if not pu_col or not status_col or not adate_col:
-    st.error("Please map PU CTRY, STATUS, and Actual Delivery columns.")
-    st.stop()
-
-ctrl_keywords = [w.strip().lower() for w in ctrl_txt.split(",") if w.strip()]
-target_sel = None if target_col == "— none —" else target_col
-qc_sel = None if qc_col == "— none —" else qc_col
-
-d = preprocess_for_otp(raw, pu_col, status_col, adate_col, target_sel, qc_sel, ctrl_keywords)
+# Preprocess + compute
+d = preprocess(df, pu_col, status_col, adate_col, target_col, qc_col, ctrl_kw)
 if d.empty:
-    st.error("No rows after filtering (PU CTRY in DE/IT/IL and STATUS = 440-BILLED). Check mappings and data.")
+    st.error("No rows after filtering (PU in DE/IT/IL & STATUS=440-BILLED). Check mappings/data.")
     st.stop()
 
-gross, net = compute_monthly_otp(d)
+gross, net = compute_otp_monthly(d)
 
-# KPIs (latest month)
-latest_m = gross["_month"].max() if not gross.empty else None
-gross_latest = float(gross.loc[gross["_month"] == latest_m, "Gross_OTP_%"].iloc[0]) if latest_m is not None else np.nan
+# KPIs
+latest = gross["_month"].max() if not gross.empty else None
+gross_latest = float(gross.loc[gross["_month"]==latest, "Gross_OTP_%"].iloc[0]) if latest is not None else np.nan
 
-latest_n_m = net["_month"].max() if not net.empty else None
-net_latest = float(net.loc[net["_month"] == latest_n_m, "Net_OTP_%"].iloc[0]) if latest_n_m is not None else np.nan
+latest_net = net["_month"].max() if not net.empty else None
+net_latest = float(net.loc[net["_month"]==latest_net, "Net_OTP_%"].iloc[0]) if latest_net is not None else np.nan
 
 c1, c2 = st.columns(2)
 with c1:
-    cl = cls_for_target(gross_latest, otp_target)
     txt = "" if pd.isna(gross_latest) else f"{gross_latest:.1f}%"
     st.markdown('<div class="kpi-card">', unsafe_allow_html=True)
     st.markdown('<div class="kpi-title">Gross OTP (latest month)</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="kpi-value {cl}">{txt}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi-value {status_cls(gross_latest, otp_target)}">{txt}</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="kpi-title">Objective: {otp_target:.0f}%</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
@@ -191,40 +190,41 @@ with c2:
     st.markdown('<div class="kpi-card">', unsafe_allow_html=True)
     st.markdown('<div class="kpi-title">Net OTP (Controllables, latest month)</div>', unsafe_allow_html=True)
     st.markdown(f'<div class="kpi-value">{txt}</div>', unsafe_allow_html=True)
-    st.markdown(f'<div class="kpi-title">QC includes: {", ".join(ctrl_keywords) if ctrl_keywords else "—"}</div>', unsafe_allow_html=True)
+    st.markdown(f'<div class="kpi-title">QC includes: {", ".join(ctrl_kw) if ctrl_kw else "—"}</div>', unsafe_allow_html=True)
     st.markdown('</div>', unsafe_allow_html=True)
 
 st.markdown("---")
 
-# Trend chart
-st.subheader("OTP Trend by Month (Actual Delivery Date)")
-fig = go.Figure()
+# Trend charts (native Streamlit charts)
+st.subheader("OTP Trend — Gross (Actual Delivery Month)")
 if not gross.empty:
-    fig.add_trace(go.Scatter(x=gross["_month"], y=gross["Gross_OTP_%"], mode="lines+markers", name="Gross OTP"))
+    gross_chart = gross.set_index("_month")[["Gross_OTP_%"]]
+    st.line_chart(gross_chart)
+else:
+    st.info("No Gross OTP data.")
+
+st.subheader("OTP Trend — Net (Controllables)")
 if not net.empty:
-    fig.add_trace(go.Scatter(x=net["_month"], y=net["Net_OTP_%"], mode="lines+markers", name="Net OTP (Controllables)"))
-fig.add_hline(y=otp_target, line_dash="dash", line_color="red", annotation_text=f"Target {otp_target:.0f}%")
-fig.update_layout(yaxis_title="OTP (%)", xaxis_title="Month", hovermode="x unified", height=420)
-st.plotly_chart(fig, use_container_width=True)
+    net_chart = net.set_index("_month")[["Net_OTP_%"]]
+    st.line_chart(net_chart)
+else:
+    st.info("No Net OTP data.")
 
 # Tables + downloads
-def to_csv_bytes(df_: pd.DataFrame) -> bytes:
-    return df_.to_csv(index=False).encode("utf-8")
+def to_csv_bytes(df_): return df_.to_csv(index=False).encode("utf-8")
 
-st.subheader("Monthly OTP — Gross (STATUS 440-BILLED)")
-if gross.empty:
-    st.info("No Gross OTP data available.")
-else:
-    gross_out = gross.rename(columns={"_month": "Month", "On_Time": "On_Time_Count", "Total": "Total_Count"})
+st.subheader("Monthly OTP — Gross")
+if not gross.empty:
+    gross_out = gross.rename(columns={"_month":"Month","On_Time":"On_Time_Count","Total":"Total_Count"})
     st.dataframe(gross_out, use_container_width=True)
     st.download_button("Download Gross OTP CSV", data=to_csv_bytes(gross_out), file_name="otp_gross_by_month.csv")
-
-st.subheader("Monthly OTP — Net (Controllables, STATUS 440-BILLED)")
-if net.empty:
-    st.info("No Net OTP data available (no controllable rows).")
 else:
-    net_out = net.rename(columns={"_month": "Month", "On_Time": "On_Time_Count", "Total": "Total_Count"})
+    st.info("No rows.")
+
+st.subheader("Monthly OTP — Net (Controllables)")
+if not net.empty:
+    net_out = net.rename(columns={"_month":"Month","On_Time":"On_Time_Count","Total":"Total_Count"})
     st.dataframe(net_out, use_container_width=True)
     st.download_button("Download Net OTP CSV", data=to_csv_bytes(net_out), file_name="otp_net_by_month.csv")
-
-st.caption("Filters: PU CTRY ∈ {DE, IT, IL} and STATUS = 440-BILLED. OTP: POD ≤ Target (UPD DEL or QDT). Net OTP: QC contains Agent/Customs/Warehouse.")
+else:
+    st.info("No controllable rows.")
