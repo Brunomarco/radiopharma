@@ -219,11 +219,11 @@ if uploaded is not None:
 
     # ---------- Executive KPI cards ----------
     latest_month = otp_grp["_month_adate"].max() if not otp_grp.empty else None
-    latest_row = otp_grp.loc[otp_grp["_month_adate"]==latest_month] if latest_month is not None else pd.DataFrame()
+    latest_row = otp_grp.loc[otp_grp["_month_adate"] == latest_month] if latest_month is not None else pd.DataFrame()
     gross_latest = float(latest_row["gross_otp_pct"].iloc[0]) if not latest_row.empty else np.nan
 
     net_latest_month = otp_net_grp["_month_adate"].max() if not otp_net_grp.empty else None
-    net_latest_row = otp_net_grp.loc[otp_net_grp["_month_adate"]==net_latest_month] if net_latest_month is not None else pd.DataFrame()
+    net_latest_row = otp_net_grp.loc[otp_net_grp["_month_adate"] == net_latest_month] if net_latest_month is not None else pd.DataFrame()
     net_latest = float(net_latest_row["net_otp_pct"].iloc[0]) if not net_latest_row.empty else np.nan
 
     objective = 0.95
@@ -237,25 +237,34 @@ if uploaded is not None:
         return "bad"
 
     col1, col2, col3 = st.columns(3)
+
+    # --- KPI 1: Gross OTP ---
+    gross_value_text = "" if np.isnan(gross_latest) else f"{gross_latest*100:.1f}%"
     with col1:
         st.markdown('<div class="kpi-card">', unsafe_allow_html=True)
-        st.markdown(f'<div class="kpi-title">Gross OTP (latest month)</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="kpi-value {status_class(gross_latest, objective)}'>{"" if np.isnan(gross_latest) else f"{gross_latest*100:.1f}%"}</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="kpi-sub">Objective: 95%</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kpi-title">Gross OTP (latest month)</div>', unsafe_allow_html=True)
+        st.markdown(
+            f'<div class="kpi-value {status_class(gross_latest, objective)}">{gross_value_text}</div>',
+            unsafe_allow_html=True
+        )
+        st.markdown('<div class="kpi-sub">Objective: 95%</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
+    # --- KPI 2: Net OTP ---
+    net_value_text = "" if np.isnan(net_latest) else f"{net_latest*100:.1f}%"
     with col2:
         st.markdown('<div class="kpi-card">', unsafe_allow_html=True)
-        st.markdown(f'<div class="kpi-title">Net OTP (controllables)</div>', unsafe_allow_html=True)
-        st.markdown(f'<div class="kpi-value">{"" if np.isnan(net_latest) else f"{net_latest*100:.1f}%"}</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kpi-title">Net OTP (controllables)</div>', unsafe_allow_html=True)
+        st.markdown(f'<div class="kpi-value">{net_value_text}</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="kpi-sub">QC includes: {", ".join(controllable_keys) if controllable_keys else "—"}</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
 
+    # --- KPI 3: Scope summary ---
+    total_pieces = df["_pieces"].sum()
+    total_charges = df["_charges"].sum()
     with col3:
-        total_pieces = df["_pieces"].sum()
-        total_charges = df["_charges"].sum()
         st.markdown('<div class="kpi-card">', unsafe_allow_html=True)
-        st.markdown(f'<div class="kpi-title">Scope</div>', unsafe_allow_html=True)
+        st.markdown('<div class="kpi-title">Scope</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="kpi-value">{int(total_pieces):,} pcs</div>', unsafe_allow_html=True)
         st.markdown(f'<div class="kpi-sub">Total Charges: {total_charges:,.2f}</div>', unsafe_allow_html=True)
         st.markdown('</div>', unsafe_allow_html=True)
